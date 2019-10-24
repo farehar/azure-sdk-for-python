@@ -8,34 +8,25 @@
 
 from datetime import datetime, timedelta
 from azure.core.exceptions import ResourceExistsError
-try:
-    import settings_real as settings
-except ImportError:
-    import queue_settings_fake as settings
+from devtools_testutils import ResourceGroupPreparer, StorageAccountPreparer
 
 from queuetestcase import (
-    QueueTestCase,
-    record,
-    TestMode
+    QueueTestCase
 )
 
 
 class TestMessageQueueSamples(QueueTestCase):
 
-    connection_string = settings.CONNECTION_STRING
-    storage_url = "{}://{}.queue.core.windows.net".format(
-        settings.PROTOCOL,
-        settings.STORAGE_ACCOUNT_NAME
-    )
-
-    def test_set_access_policy(self):
+    @ResourceGroupPreparer()              
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    def test_set_access_policy(self, resource_group, location, storage_account, storage_account_key):
         # SAS URL is calculated from storage key, so this test runs live only
-        if TestMode.need_recording_file(self.test_mode):
+        if not self.is_live:
             return
 
         # [START create_queue_client_from_connection_string]
         from azure.storage.queue import QueueClient
-        queue_client = QueueClient.from_connection_string(self.connection_string, "queuetest")
+        queue_client = QueueClient.from_connection_string(self.connection_string(storage_account, storage_account_key), "queuetest")
         # [END create_queue_client_from_connection_string]
 
         # Create the queue
@@ -43,16 +34,16 @@ class TestMessageQueueSamples(QueueTestCase):
             queue_client.create_queue()
         except ResourceExistsError:
             pass
-        queue_client.enqueue_message(u"hello world")
+        queue_client.send_message(u"hello world")
 
         try:
             # [START set_access_policy]
             # Create an access policy
-            from azure.storage.queue import AccessPolicy, QueuePermissions
+            from azure.storage.queue import AccessPolicy, QueueSasPermissions
             access_policy = AccessPolicy()
             access_policy.start = datetime.utcnow() - timedelta(hours=1)
             access_policy.expiry = datetime.utcnow() + timedelta(hours=1)
-            access_policy.permission = QueuePermissions.READ
+            access_policy.permission = QueueSasPermissions(read=True)
             identifiers = {'my-access-policy-id': access_policy}
 
             # Set the access policy
@@ -61,14 +52,19 @@ class TestMessageQueueSamples(QueueTestCase):
 
             # Use the access policy to generate a SAS token
             # [START queue_client_sas_token]
-            sas_token = queue_client.generate_shared_access_signature(
+            from azure.storage.queue import generate_queue_sas
+
+            sas_token = generate_queue_sas(
+                queue_client.account_name,
+                queue_client.queue_name,
+                queue_client.credential.account_key,
                 policy_id='my-access-policy-id'
             )
             # [END queue_client_sas_token]
 
             # Authenticate with the sas token
             # [START create_queue_client]
-            q = QueueClient(
+            q = QueueClient.from_queue_url(
                 queue_url=queue_client.url,
                 credential=sas_token
             )
@@ -82,12 +78,13 @@ class TestMessageQueueSamples(QueueTestCase):
             # Delete the queue
             queue_client.delete_queue()
 
-    @record
-    def test_queue_metadata(self):
+    @ResourceGroupPreparer()              
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    def test_queue_metadata(self, resource_group, location, storage_account, storage_account_key):
 
         # Instantiate a queue client
         from azure.storage.queue import QueueClient
-        queue = QueueClient.from_connection_string(self.connection_string, "metaqueue")
+        queue = QueueClient.from_connection_string(self.connection_string(storage_account, storage_account_key), "metaqueue")
 
         # Create the queue
         queue.create_queue()
@@ -107,24 +104,25 @@ class TestMessageQueueSamples(QueueTestCase):
             # Delete the queue
             queue.delete_queue()
 
-    @record
-    def test_enqueue_and_receive_messages(self):
+    @ResourceGroupPreparer()              
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    def test_send_and_receive_messages(self, resource_group, location, storage_account, storage_account_key):
 
         # Instantiate a queue client
         from azure.storage.queue import QueueClient
-        queue = QueueClient.from_connection_string(self.connection_string, "messagequeue")
+        queue = QueueClient.from_connection_string(self.connection_string(storage_account, storage_account_key), "messagequeue")
 
         # Create the queue
         queue.create_queue()
 
         try:
-            # [START enqueue_messages]
-            queue.enqueue_message(u"message1")
-            queue.enqueue_message(u"message2", visibility_timeout=30)  # wait 30s before becoming visible
-            queue.enqueue_message(u"message3")
-            queue.enqueue_message(u"message4")
-            queue.enqueue_message(u"message5")
-            # [END enqueue_messages]
+            # [START send_messages]
+            queue.send_message(u"message1")
+            queue.send_message(u"message2", visibility_timeout=30)  # wait 30s before becoming visible
+            queue.send_message(u"message3")
+            queue.send_message(u"message4")
+            queue.send_message(u"message5")
+            # [END send_messages]
 
             # [START receive_messages]
             # Receive messages one-by-one
@@ -150,23 +148,24 @@ class TestMessageQueueSamples(QueueTestCase):
             # Delete the queue
             queue.delete_queue()
 
-    @record
-    def test_delete_and_clear_messages(self):
+    @ResourceGroupPreparer()              
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    def test_delete_and_clear_messages(self, resource_group, location, storage_account, storage_account_key):
 
         # Instantiate a queue client
         from azure.storage.queue import QueueClient
-        queue = QueueClient.from_connection_string(self.connection_string, "delqueue")
+        queue = QueueClient.from_connection_string(self.connection_string(storage_account, storage_account_key), "delqueue")
 
         # Create the queue
         queue.create_queue()
 
         try:
-            # Enqueue messages
-            queue.enqueue_message(u"message1")
-            queue.enqueue_message(u"message2")
-            queue.enqueue_message(u"message3")
-            queue.enqueue_message(u"message4")
-            queue.enqueue_message(u"message5")
+            # Send messages
+            queue.send_message(u"message1")
+            queue.send_message(u"message2")
+            queue.send_message(u"message3")
+            queue.send_message(u"message4")
+            queue.send_message(u"message5")
 
             # [START delete_message]
             # Get the message at the front of the queue
@@ -184,22 +183,23 @@ class TestMessageQueueSamples(QueueTestCase):
             # Delete the queue
             queue.delete_queue()
 
-    @record
-    def test_peek_messages(self):
+    @ResourceGroupPreparer()              
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    def test_peek_messages(self, resource_group, location, storage_account, storage_account_key):
         # Instantiate a queue client
         from azure.storage.queue import QueueClient
-        queue = QueueClient.from_connection_string(self.connection_string, "peekqueue")
+        queue = QueueClient.from_connection_string(self.connection_string(storage_account, storage_account_key), "peekqueue")
 
         # Create the queue
         queue.create_queue()
 
         try:
-            # Enqueue messages
-            queue.enqueue_message(u"message1")
-            queue.enqueue_message(u"message2")
-            queue.enqueue_message(u"message3")
-            queue.enqueue_message(u"message4")
-            queue.enqueue_message(u"message5")
+            # Send messages
+            queue.send_message(u"message1")
+            queue.send_message(u"message2")
+            queue.send_message(u"message3")
+            queue.send_message(u"message4")
+            queue.send_message(u"message5")
 
             # [START peek_message]
             # Peek at one message at the front of the queue
@@ -217,20 +217,21 @@ class TestMessageQueueSamples(QueueTestCase):
             # Delete the queue
             queue.delete_queue()
 
-    @record
-    def test_update_message(self):
+    @ResourceGroupPreparer()              
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    def test_update_message(self, resource_group, location, storage_account, storage_account_key):
 
         # Instantiate a queue client
         from azure.storage.queue import QueueClient
-        queue = QueueClient.from_connection_string(self.connection_string, "updatequeue")
+        queue = QueueClient.from_connection_string(self.connection_string(storage_account, storage_account_key), "updatequeue")
 
         # Create the queue
         queue.create_queue()
 
         try:
             # [START update_message]
-            # Enqueue a message
-            queue.enqueue_message(u"update me")
+            # Send a message
+            queue.send_message(u"update me")
 
             # Receive the message
             messages = queue.receive_messages()

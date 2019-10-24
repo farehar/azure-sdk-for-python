@@ -11,18 +11,21 @@ import pytest
 import os
 import unittest
 from datetime import datetime, timedelta
-from azure.core.exceptions import HttpResponseError, ResourceExistsError
+from azure.core import MatchConditions
+from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceModifiedError
 
 from azure.storage.blob import (
     BlobServiceClient,
     ContainerClient,
     BlobClient,
     BlobProperties,
-    BlobPermissions,
+    BlobSasPermissions,
     BlobType,
     PremiumPageBlobTier,
     SequenceNumberAction,
-    StorageErrorCode)
+    StorageErrorCode,
+    generate_blob_sas)
+from azure.storage.blob._shared.policies import StorageContentValidation
 
 from testcase import (
     StorageTestCase,
@@ -30,12 +33,15 @@ from testcase import (
     record,
 )
 
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 TEST_BLOB_PREFIX = 'blob'
 FILE_PATH = 'blob_input.temp.dat'
 LARGE_BLOB_SIZE = 64 * 1024 + 512
 EIGHT_TB = 8 * 1024 * 1024 * 1024 * 1024
-#------------------------------------------------------------------------------s
+SOURCE_BLOB_SIZE = 8 * 1024
+
+
+# ------------------------------------------------------------------------------s
 
 class StoragePageBlobTest(StorageTestCase):
 
@@ -55,14 +61,18 @@ class StoragePageBlobTest(StorageTestCase):
             max_page_size=4 * 1024)
         self.config = self.bs._config
         self.container_name = self.get_resource_name('utcontainer')
+        self.source_container_name = self.get_resource_name('utcontainersource')
 
         if not self.is_playback():
             self.bs.create_container(self.container_name)
+            # create a container for copy source
+            self.bs.create_container(self.source_container_name)
 
     def tearDown(self):
         if not self.is_playback():
             try:
                 self.bs.delete_container(self.container_name)
+                self.bs.delete_container(self.source_container_name)
             except:
                 pass
 
@@ -74,17 +84,24 @@ class StoragePageBlobTest(StorageTestCase):
 
         return super(StoragePageBlobTest, self).tearDown()
 
-    #--Helpers-----------------------------------------------------------------
+    # --Helpers-----------------------------------------------------------------
 
     def _get_blob_reference(self):
         return self.bs.get_blob_client(
             self.container_name,
             self.get_resource_name(TEST_BLOB_PREFIX))
 
-    def _create_blob(self, length=512):
+    def _create_blob(self, length=512, sequence_number=None):
         blob = self._get_blob_reference()
-        blob.create_page_blob(size=length)
+        blob.create_page_blob(size=length, sequence_number=sequence_number)
         return blob
+
+    def _create_source_blob(self, data, offset, length):
+        blob_client = self.bs.get_blob_client(self.source_container_name,
+                                              self.get_resource_name(TEST_BLOB_PREFIX))
+        blob_client.create_page_blob(size=length)
+        blob_client.upload_page(data, offset=offset, length=length)
+        return blob_client
 
     def _wait_for_async_copy(self, blob):
         count = 0
@@ -97,15 +114,26 @@ class StoragePageBlobTest(StorageTestCase):
             props = blob.get_blob_properties()
         return props
 
+    def _create_sparse_page_blob(self, size=1024*1024, data=''):
+        blob_client = self._get_blob_reference()
+        blob_client.create_page_blob(size=size)
+
+        range_start = 8*1024 + 512
+
+        # the page blob will be super sparse like this:'                         some data                      '
+        blob_client.upload_page(data, offset=range_start, length=len(data))
+
+        return blob_client
+
     def assertBlobEqual(self, container_name, blob_name, expected_data):
         blob = self.bs.get_blob_client(container_name, blob_name)
         actual_data = blob.download_blob()
-        self.assertEqual(b"".join(list(actual_data)), expected_data)
+        self.assertEqual(actual_data.readall(), expected_data)
 
-    def assertRangeEqual(self, container_name, blob_name, expected_data, start_range, end_range):
+    def assertRangeEqual(self, container_name, blob_name, expected_data, offset, length):
         blob = self.bs.get_blob_client(container_name, blob_name)
-        actual_data = blob.download_blob(offset=start_range, length=end_range)
-        self.assertEqual(b"".join(list(actual_data)), expected_data)
+        actual_data = blob.download_blob(offset=offset, length=length)
+        self.assertEqual(actual_data.readall(), expected_data)
 
     class NonSeekableFile(object):
         def __init__(self, wrapped_file):
@@ -117,7 +145,7 @@ class StoragePageBlobTest(StorageTestCase):
         def read(self, count):
             return self.wrapped_file.read(count)
 
-    #--Test cases for page blobs --------------------------------------------
+    # --Test cases for page blobs --------------------------------------------
     @record
     def test_create_blob(self):
         # Arrange
@@ -136,7 +164,7 @@ class StoragePageBlobTest(StorageTestCase):
         # Arrange
         blob = self._get_blob_reference()
         metadata = {'hello': 'world', 'number': '42'}
-        
+
         # Act
         resp = blob.create_page_blob(512, metadata=metadata)
 
@@ -152,11 +180,11 @@ class StoragePageBlobTest(StorageTestCase):
 
         # Act        
         data = self.get_random_bytes(512)
-        blob.upload_page(data, 0, 511, lease=lease)
+        blob.upload_page(data, offset=0, length=512, lease=lease)
 
         # Assert
         content = blob.download_blob(lease=lease)
-        self.assertEqual(b"".join(list(content)), data)
+        self.assertEqual(content.readall(), data)
 
     @record
     def test_update_page(self):
@@ -165,7 +193,7 @@ class StoragePageBlobTest(StorageTestCase):
 
         # Act
         data = self.get_random_bytes(512)
-        resp = blob.upload_page(data, 0, 511)
+        resp = blob.upload_page(data, offset=0, length=512)
 
         # Assert
         self.assertIsNotNone(resp.get('etag'))
@@ -207,21 +235,21 @@ class StoragePageBlobTest(StorageTestCase):
 
         # Act
         data = self.get_random_bytes(512)
-        start_range = EIGHT_TB - 512
-        end_range = EIGHT_TB - 1
-        resp = blob.upload_page(data, start_range, end_range)
+        start_offset = EIGHT_TB - 512
+        length = 512
+        resp = blob.upload_page(data, offset=start_offset, length=length)
         props = blob.get_blob_properties()
         page_ranges, cleared = blob.get_page_ranges()
-        
+
         # Assert
         self.assertIsNotNone(resp.get('etag'))
         self.assertIsNotNone(resp.get('last_modified'))
         self.assertIsNotNone(resp.get('blob_sequence_number'))
-        self.assertRangeEqual(self.container_name, blob.blob_name, data, start_range, end_range)
+        self.assertRangeEqual(self.container_name, blob.blob_name, data, start_offset, length)
         self.assertEqual(props.size, EIGHT_TB)
         self.assertEqual(1, len(page_ranges))
-        self.assertEqual(page_ranges[0]['start'], start_range)
-        self.assertEqual(page_ranges[0]['end'], end_range)
+        self.assertEqual(page_ranges[0]['start'], start_offset)
+        self.assertEqual(page_ranges[0]['end'], start_offset + length - 1)
 
     @record
     def test_update_page_with_md5(self):
@@ -230,7 +258,7 @@ class StoragePageBlobTest(StorageTestCase):
 
         # Act
         data = self.get_random_bytes(512)
-        resp = blob.upload_page(data, 0, 511, validate_content=True)
+        resp = blob.upload_page(data, offset=0, length=512, validate_content=True)
 
         # Assert
 
@@ -240,7 +268,7 @@ class StoragePageBlobTest(StorageTestCase):
         blob = self._create_blob()
 
         # Act
-        resp = blob.clear_page(0, 511)
+        resp = blob.clear_page(offset=0, length=512)
 
         # Assert
         self.assertIsNotNone(resp.get('etag'))
@@ -251,14 +279,14 @@ class StoragePageBlobTest(StorageTestCase):
     @record
     def test_put_page_if_sequence_number_lt_success(self):
         # Arrange     
-        blob = self._get_blob_reference() 
+        blob = self._get_blob_reference()
         data = self.get_random_bytes(512)
 
         start_sequence = 10
         blob.create_page_blob(512, sequence_number=start_sequence)
 
         # Act
-        blob.upload_page(data, 0, 511, if_sequence_number_lt=start_sequence + 1)
+        blob.upload_page(data, offset=0, length=512, if_sequence_number_lt=start_sequence + 1)
 
         # Assert
         self.assertBlobEqual(self.container_name, blob.blob_name, data)
@@ -266,27 +294,27 @@ class StoragePageBlobTest(StorageTestCase):
     @record
     def test_update_page_if_sequence_number_lt_failure(self):
         # Arrange
-        blob = self._get_blob_reference() 
+        blob = self._get_blob_reference()
         data = self.get_random_bytes(512)
         start_sequence = 10
         blob.create_page_blob(512, sequence_number=start_sequence)
 
         # Act
         with self.assertRaises(HttpResponseError):
-            blob.upload_page(data, 0, 511, if_sequence_number_lt=start_sequence)
+            blob.upload_page(data, offset=0, length=512, if_sequence_number_lt=start_sequence)
 
         # Assert
 
     @record
     def test_update_page_if_sequence_number_lte_success(self):
         # Arrange
-        blob = self._get_blob_reference() 
+        blob = self._get_blob_reference()
         data = self.get_random_bytes(512)
         start_sequence = 10
         blob.create_page_blob(512, sequence_number=start_sequence)
 
         # Act
-        blob.upload_page(data, 0, 511, if_sequence_number_lte=start_sequence)
+        blob.upload_page(data, offset=0, length=512, if_sequence_number_lte=start_sequence)
 
         # Assert
         self.assertBlobEqual(self.container_name, blob.blob_name, data)
@@ -294,27 +322,27 @@ class StoragePageBlobTest(StorageTestCase):
     @record
     def test_update_page_if_sequence_number_lte_failure(self):
         # Arrange
-        blob = self._get_blob_reference() 
+        blob = self._get_blob_reference()
         data = self.get_random_bytes(512)
         start_sequence = 10
         blob.create_page_blob(512, sequence_number=start_sequence)
 
         # Act
         with self.assertRaises(HttpResponseError):
-            blob.upload_page(data, 0, 511, if_sequence_number_lte=start_sequence - 1)
+            blob.upload_page(data, offset=0, length=512, if_sequence_number_lte=start_sequence - 1)
 
         # Assert
 
     @record
     def test_update_page_if_sequence_number_eq_success(self):
         # Arrange
-        blob = self._get_blob_reference() 
+        blob = self._get_blob_reference()
         data = self.get_random_bytes(512)
         start_sequence = 10
         blob.create_page_blob(512, sequence_number=start_sequence)
 
         # Act
-        blob.upload_page(data, 0, 511, if_sequence_number_eq=start_sequence)
+        blob.upload_page(data, offset=0, length=512, if_sequence_number_eq=start_sequence)
 
         # Assert
         self.assertBlobEqual(self.container_name, blob.blob_name, data)
@@ -322,14 +350,14 @@ class StoragePageBlobTest(StorageTestCase):
     @record
     def test_update_page_if_sequence_number_eq_failure(self):
         # Arrange
-        blob = self._get_blob_reference() 
+        blob = self._get_blob_reference()
         data = self.get_random_bytes(512)
         start_sequence = 10
         blob.create_page_blob(512, sequence_number=start_sequence)
 
         # Act
         with self.assertRaises(HttpResponseError):
-            blob.upload_page(data, 0, 511, if_sequence_number_eq=start_sequence - 1)
+            blob.upload_page(data, offset=0, length=512, if_sequence_number_eq=start_sequence - 1)
 
         # Assert
 
@@ -340,11 +368,547 @@ class StoragePageBlobTest(StorageTestCase):
 
         # Act
         data = u'abcdefghijklmnop' * 32
-        resp = blob.upload_page(data, 0, 511)
+        resp = blob.upload_page(data, offset=0, length=512)
 
         # Assert
         self.assertIsNotNone(resp.get('etag'))
         self.assertIsNotNone(resp.get('last_modified'))
+
+    @record
+    def test_upload_pages_from_url(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client.upload_pages_from_url(
+            source_blob_client.url + "?" + sas, offset=0, length=4 * 1024, source_offset=0)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        resp = destination_blob_client.upload_pages_from_url(
+            source_blob_client.url + "?" + sas, offset=4 * 1024,
+            length=4 * 1024, source_offset=4 * 1024)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertEqual(blob_properties.size, SOURCE_BLOB_SIZE)
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+    @record
+    def test_upload_pages_from_url_and_validate_content_md5(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        src_md5 = StorageContentValidation.get_content_md5(source_blob_data)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                             offset=0,
+                                                             length=SOURCE_BLOB_SIZE,
+                                                             source_offset=0,
+                                                             source_content_md5=src_md5)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                          offset=0,
+                                                          length=SOURCE_BLOB_SIZE,
+                                                          source_offset=0,
+                                                          source_content_md5=StorageContentValidation.get_content_md5(
+                                                              b"POTATO"))
+
+    @record
+    def test_upload_pages_from_url_with_source_if_modified(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   offset=0,
+                                   length=SOURCE_BLOB_SIZE,
+                                   source_offset=0,
+                                   source_if_modified_since=source_properties.get('last_modified') - timedelta(
+                                       hours=15))
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                          offset=0,
+                                                          length=SOURCE_BLOB_SIZE,
+                                                          source_offset=0,
+                                                          source_if_modified_since=source_properties.get(
+                                                              'last_modified'))
+
+    @record
+    def test_upload_pages_from_url_with_source_if_unmodified(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   offset=0,
+                                   length=SOURCE_BLOB_SIZE,
+                                   source_offset=0,
+                                   source_if_unmodified_since=source_properties.get('last_modified'))
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client \
+                .upload_pages_from_url(source_blob_client.url + "?" + sas, offset=0,
+                                       length=SOURCE_BLOB_SIZE,
+                                       source_offset=0,
+                                       source_if_unmodified_since=source_properties.get('last_modified') - timedelta(
+                                           hours=15))
+
+    @record
+    def test_upload_pages_from_url_with_source_if_match(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   offset=0,
+                                   length=SOURCE_BLOB_SIZE,
+                                   source_offset=0,
+                                   source_etag=source_properties.get('etag'),
+                                   source_match_condition=MatchConditions.IfNotModified)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client \
+                .upload_pages_from_url(source_blob_client.url + "?" + sas, offset=0,
+                                       length=SOURCE_BLOB_SIZE,
+                                       source_offset=0,
+                                       source_etag='0x111111111111111',
+                                       source_match_condition=MatchConditions.IfNotModified)
+
+    @record
+    def test_upload_pages_from_url_with_source_if_none_match(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   offset=0,
+                                   length=SOURCE_BLOB_SIZE,
+                                   source_offset=0,
+                                   source_etag='0x111111111111111',
+                                   source_match_condition=MatchConditions.IfModified)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client \
+                .upload_pages_from_url(source_blob_client.url + "?" + sas, offset=0,
+                                       length=SOURCE_BLOB_SIZE,
+                                       source_offset=0,
+                                       source_etag=source_properties.get('etag'),
+                                       source_match_condition=MatchConditions.IfModified)
+
+    @record
+    def test_upload_pages_from_url_with_if_modified(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   offset=0,
+                                   length=SOURCE_BLOB_SIZE,
+                                   source_offset=0,
+                                   if_modified_since=source_properties.get('last_modified') - timedelta(
+                                       minutes=15))
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client \
+                .upload_pages_from_url(source_blob_client.url + "?" + sas, offset=0,
+                                       length=SOURCE_BLOB_SIZE,
+                                       source_offset=0,
+                                       if_modified_since=blob_properties.get('last_modified'))
+
+    @record
+    def test_upload_pages_from_url_with_if_unmodified(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+        destination_blob_properties = destination_blob_client.get_blob_properties()
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   offset=0,
+                                   length=SOURCE_BLOB_SIZE,
+                                   source_offset=0,
+                                   if_unmodified_since=destination_blob_properties.get('last_modified'))
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(ResourceModifiedError):
+            destination_blob_client \
+                .upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                       SOURCE_BLOB_SIZE,
+                                       0,
+                                       if_unmodified_since=source_properties.get('last_modified') - timedelta(
+                                           minutes=15))
+
+    @record
+    def test_upload_pages_from_url_with_if_match(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+        destination_blob_properties = destination_blob_client.get_blob_properties()
+
+        # Act: make update page from url calls
+        resp = destination_blob_client.upload_pages_from_url(
+            source_blob_client.url + "?" + sas, 0, SOURCE_BLOB_SIZE, 0,
+            etag=destination_blob_properties.get('etag'),
+            match_condition=MatchConditions.IfNotModified)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client.upload_pages_from_url(
+                source_blob_client.url + "?" + sas, 0, SOURCE_BLOB_SIZE, 0,
+                etag='0x111111111111111',
+                match_condition=MatchConditions.IfNotModified)
+
+    @record
+    def test_upload_pages_from_url_with_if_none_match(self):
+        # Arrange
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   0,
+                                   SOURCE_BLOB_SIZE,
+                                   0,
+                                   etag='0x111111111111111',
+                                   match_condition=MatchConditions.IfModified)
+
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client \
+                .upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                       SOURCE_BLOB_SIZE,
+                                       0,
+                                       etag=blob_properties.get('etag'),
+                                       match_condition=MatchConditions.IfModified)
+
+    @record
+    def test_upload_pages_from_url_with_sequence_number_lt(self):
+        # Arrange
+        start_sequence = 10
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE, sequence_number=start_sequence)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   0,
+                                   SOURCE_BLOB_SIZE,
+                                   0,
+                                   if_sequence_number_lt=start_sequence + 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client \
+                .upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                       SOURCE_BLOB_SIZE,
+                                       0,
+                                       if_sequence_number_lt=start_sequence)
+
+    @record
+    def test_upload_pages_from_url_with_sequence_number_lte(self):
+        # Arrange
+        start_sequence = 10
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE, sequence_number=start_sequence)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   0,
+                                   SOURCE_BLOB_SIZE,
+                                   0,
+                                   if_sequence_number_lte=start_sequence)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client \
+                .upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                       SOURCE_BLOB_SIZE,
+                                       0,
+                                       if_sequence_number_lte=start_sequence - 1)
+
+    @record
+    def test_upload_pages_from_url_with_sequence_number_eq(self):
+        # Arrange
+        start_sequence = 10
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = self._create_blob(SOURCE_BLOB_SIZE, sequence_number=start_sequence)
+
+        # Act: make update page from url calls
+        resp = destination_blob_client \
+            .upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                   0,
+                                   SOURCE_BLOB_SIZE,
+                                   0,
+                                   if_sequence_number_eq=start_sequence)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = destination_blob_client.get_blob_properties()
+        self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            destination_blob_client \
+                .upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                       SOURCE_BLOB_SIZE,
+                                       0,
+                                       if_sequence_number_eq=start_sequence + 1)
 
     @record
     def test_get_page_ranges_no_pages(self):
@@ -364,8 +928,8 @@ class StoragePageBlobTest(StorageTestCase):
         # Arrange
         blob = self._create_blob(2048)
         data = self.get_random_bytes(512)
-        resp1 = blob.upload_page(data, 0, 511)
-        resp2 = blob.upload_page(data, 1024, 1535)
+        resp1 = blob.upload_page(data, offset=0, length=512)
+        resp2 = blob.upload_page(data, offset=1024, length=512)
 
         # Act
         ranges, cleared = blob.get_page_ranges()
@@ -379,16 +943,15 @@ class StoragePageBlobTest(StorageTestCase):
         self.assertEqual(ranges[1]['start'], 1024)
         self.assertEqual(ranges[1]['end'], 1535)
 
-
     @record
     def test_get_page_ranges_diff(self):
         # Arrange
         blob = self._create_blob(2048)
         data = self.get_random_bytes(1536)
         snapshot1 = blob.create_snapshot()
-        blob.upload_page(data, 0, 1535)
+        blob.upload_page(data, offset=0, length=1536)
         snapshot2 = blob.create_snapshot()
-        blob.clear_page(512, 1023)
+        blob.clear_page(offset=512, length=512)
 
         # Act
         ranges1, cleared1 = blob.get_page_ranges(previous_snapshot_diff=snapshot1)
@@ -415,29 +978,25 @@ class StoragePageBlobTest(StorageTestCase):
         self.assertEqual(cleared2[0]['start'], 512)
         self.assertEqual(cleared2[0]['end'], 1023)
 
-    @record    
+    @record
     def test_update_page_fail(self):
         # Arrange
         blob = self._create_blob(2048)
         data = self.get_random_bytes(512)
-        resp1 = blob.upload_page(data, 0, 511)
+        resp1 = blob.upload_page(data, offset=0, length=512)
 
         # Act
-        try:
-            blob.upload_page(data, 1024, 1536)
-        except ValueError as e:
-            self.assertEqual(str(e), 'end_range must be an integer that aligns with 512 page size')
-            return
+        with self.assertRaises(ValueError):
+            blob.upload_page(data, offset=1024, length=513)
 
-        # Assert
-        raise Exception('Page range validation failed to throw on failure case')
-
+        # TODO
+        # self.assertEqual(str(e), 'end_range must be an integer that aligns with 512 page size')
 
     @record
     def test_resize_blob(self):
         # Arrange
         blob = self._create_blob(1024)
-        
+
         # Act
         resp = blob.resize_blob(512)
 
@@ -453,11 +1012,11 @@ class StoragePageBlobTest(StorageTestCase):
     def test_set_sequence_number_blob(self):
         # Arrange
         blob = self._create_blob()
-        
-        # Act
-        resp = blob.set_sequence_number(SequenceNumberAction.Update, 6)     
 
-        #Assert
+        # Act
+        resp = blob.set_sequence_number(SequenceNumberAction.Update, 6)
+
+        # Assert
         self.assertIsNotNone(resp.get('etag'))
         self.assertIsNotNone(resp.get('last_modified'))
         self.assertIsNotNone(resp.get('blob_sequence_number'))
@@ -572,6 +1131,7 @@ class StoragePageBlobTest(StorageTestCase):
 
         # Act
         progress = []
+
         def callback(response):
             current = response.context['upload_stream_current']
             total = response.context['data_stream_total']
@@ -656,6 +1216,7 @@ class StoragePageBlobTest(StorageTestCase):
 
         # Act
         progress = []
+
         def callback(response):
             current = response.context['upload_stream_current']
             total = response.context['data_stream_total']
@@ -741,7 +1302,7 @@ class StoragePageBlobTest(StorageTestCase):
             blob.upload_blob(
                 non_seekable_file,
                 length=blob_size,
-                max_connections=1,
+                max_concurrency=1,
                 blob_type=BlobType.PageBlob)
 
         # Assert
@@ -760,6 +1321,7 @@ class StoragePageBlobTest(StorageTestCase):
 
         # Act
         progress = []
+
         def callback(response):
             current = response.context['upload_stream_current']
             total = response.context['data_stream_total']
@@ -807,6 +1369,7 @@ class StoragePageBlobTest(StorageTestCase):
 
         # Act
         progress = []
+
         def callback(response):
             current = response.context['upload_stream_current']
             total = response.context['data_stream_total']
@@ -855,18 +1418,22 @@ class StoragePageBlobTest(StorageTestCase):
         # Arrange
         source_blob = self._create_blob(2048)
         data = self.get_random_bytes(512)
-        resp1 = source_blob.upload_page(data, 0, 511)
-        resp2 = source_blob.upload_page(data, 1024, 1535)
+        resp1 = source_blob.upload_page(data, offset=0, length=512)
+        resp2 = source_blob.upload_page(data, offset=1024, length=512)
         source_snapshot_blob = source_blob.create_snapshot()
 
-        snapshot_blob = BlobClient(
+        snapshot_blob = BlobClient.from_blob_url(
             source_blob.url, credential=source_blob.credential, snapshot=source_snapshot_blob)
-        sas_token = snapshot_blob.generate_shared_access_signature(
-            permission=BlobPermissions.READ,
+        sas_token = generate_blob_sas(
+            snapshot_blob.account_name,
+            snapshot_blob.container_name,
+            snapshot_blob.blob_name,
+            snapshot=snapshot_blob.snapshot,
+            account_key=snapshot_blob.credential.account_key,
+            permission=BlobSasPermissions(read=True),
             expiry=datetime.utcnow() + timedelta(hours=1),
         )
-        sas_blob = BlobClient(snapshot_blob.url, credential=sas_token)
-
+        sas_blob = BlobClient.from_blob_url(snapshot_blob.url, credential=sas_token)
 
         # Act
         dest_blob = self.bs.get_blob_client(self.container_name, 'dest_blob')
@@ -1025,8 +1592,8 @@ class StoragePageBlobTest(StorageTestCase):
             self.assertEqual(copy_ref.blob_tier, PremiumPageBlobTier.P30)
 
             source_blob2 = pbs.get_blob_client(
-               container_name,
-               self.get_resource_name(TEST_BLOB_PREFIX))
+                container_name,
+                self.get_resource_name(TEST_BLOB_PREFIX))
 
             source_blob2.create_page_blob(1024)
             source_blob2_url = '{0}/{1}/{2}'.format(
@@ -1054,6 +1621,74 @@ class StoragePageBlobTest(StorageTestCase):
         finally:
             container.delete_container()
 
-#------------------------------------------------------------------------------
+    @record
+    def test_download_sparse_page_blob_non_parallel(self):
+        # Arrange
+        self.config.max_single_get_size = 4*1024
+        self.config.max_chunk_get_size = 1024
+
+        sparse_page_blob_size = 1024 * 1024
+        data = self.get_random_bytes(2048)
+        blob_client = self._create_sparse_page_blob(size=sparse_page_blob_size, data=data)
+
+        # Act
+        page_ranges, cleared = blob_client.get_page_ranges()
+        start = page_ranges[0]['start']
+        end = page_ranges[0]['end']
+
+        content = blob_client.download_blob().readall()
+
+        # Assert
+        self.assertEqual(sparse_page_blob_size, len(content))
+        # make sure downloaded data is the same as the uploaded data
+        self.assertEqual(data, content[start: end + 1])
+        # assert all unlisted ranges are empty
+        for byte in content[:start-1]:
+            try:
+                self.assertEqual(byte, '\x00')
+            except:
+                self.assertEqual(byte, 0)
+        for byte in content[end+1:]:
+            try:
+                self.assertEqual(byte, '\x00')
+            except:
+                self.assertEqual(byte, 0)
+
+    def test_download_sparse_page_blob_parallel(self):
+        # parallel tests introduce random order of requests, can only run live
+        if TestMode.need_recording_file(self.test_mode):
+            return
+
+        # Arrange
+        self.config.max_single_get_size = 4 * 1024
+        self.config.max_chunk_get_size = 1024
+
+        sparse_page_blob_size = 1024 * 1024
+        data = self.get_random_bytes(2048)
+        blob_client = self._create_sparse_page_blob(size=sparse_page_blob_size, data=data)
+
+        # Act
+        page_ranges, cleared = blob_client.get_page_ranges()
+        start = page_ranges[0]['start']
+        end = page_ranges[0]['end']
+
+        content = blob_client.download_blob(max_concurrency=3).readall()
+
+        # Assert
+        self.assertEqual(sparse_page_blob_size, len(content))
+        # make sure downloaded data is the same as the uploaded data
+        self.assertEqual(data, content[start: end + 1])
+        # assert all unlisted ranges are empty
+        for byte in content[:start - 1]:
+            try:
+                self.assertEqual(byte, '\x00')
+            except:
+                self.assertEqual(byte, 0)
+        for byte in content[end + 1:]:
+            try:
+                self.assertEqual(byte, '\x00')
+            except:
+                self.assertEqual(byte, 0)
+# ------------------------------------------------------------------------------
 if __name__ == '__main__':
     unittest.main()

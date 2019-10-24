@@ -322,6 +322,8 @@ class FileTestCase(unittest.TestCase):
             response = copy.deepcopy(response)
             headers = response.get('headers')
             if headers:
+                headers.pop('x-ms-client-request-id', None)
+
                 def internal_scrub(key, val):
                     if key.lower() == 'retry-after':
                         return '0'
@@ -407,9 +409,9 @@ class FileTestCase(unittest.TestCase):
             from azure.identity import ClientSecretCredential
 
             return ClientSecretCredential(
+                self.settings.ACTIVE_DIRECTORY_TENANT_ID,
                 self.settings.ACTIVE_DIRECTORY_APPLICATION_ID,
-                self.settings.ACTIVE_DIRECTORY_APPLICATION_SECRET,
-                self.settings.ACTIVE_DIRECTORY_TENANT_ID
+                self.settings.ACTIVE_DIRECTORY_APPLICATION_SECRET
             )
         except ImportError:
             return FakeTokenCredential('initial token')

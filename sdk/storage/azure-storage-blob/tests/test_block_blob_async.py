@@ -14,14 +14,17 @@ from azure.core.exceptions import HttpResponseError, ResourceExistsError
 from azure.core.pipeline.transport import AioHttpTransport
 from multidict import CIMultiDict, CIMultiDictProxy
 
-from azure.storage.blob.aio import (
-    BlobServiceClient,
-    ContainerClient,
-    BlobClient,
+from azure.storage.blob import (
     BlobType,
     ContentSettings,
     BlobBlock,
     StandardBlobTier
+)
+
+from azure.storage.blob.aio import (
+    BlobServiceClient,
+    ContainerClient,
+    BlobClient,
 )
 from testcase import (
     StorageTestCase,
@@ -104,7 +107,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
         await self._setup()
         blob = self.bsc.get_blob_client(container_name, blob_name)
         stream = await blob.download_blob()
-        actual_data = await stream.content_as_bytes()
+        actual_data = await stream.readall()
         self.assertEqual(actual_data, expected_data)
 
     class NonSeekableFile(object):
@@ -182,7 +185,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
 
         # Assert
         content = await blob.download_blob()
-        actual = await content.content_as_bytes()
+        actual = await content.readall()
         self.assertEqual(actual, b'AAABBBCCC')
         self.assertEqual(content.properties.etag, put_block_list_resp.get('etag'))
         self.assertEqual(content.properties.last_modified, put_block_list_resp.get('last_modified'))
@@ -234,6 +237,30 @@ class StorageBlockBlobTestAsync(StorageTestCase):
     def test_put_block_list_with_md5(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_put_block_list_with_md5())
+
+    async def _test_put_block_list_with_blob_tier_specified(self):
+        # Arrange
+        await self._setup()
+        blob_name = self._get_blob_reference()
+        blob_client = self.bsc.get_blob_client(self.container_name, blob_name)
+        await blob_client.stage_block('1', b'AAA')
+        await blob_client.stage_block('2', b'BBB')
+        await blob_client.stage_block('3', b'CCC')
+        blob_tier = StandardBlobTier.Cool
+
+        # Act
+        block_list = [BlobBlock(block_id='1'), BlobBlock(block_id='2'), BlobBlock(block_id='3')]
+        await blob_client.commit_block_list(block_list,
+                                            standard_blob_tier=blob_tier)
+
+        # Assert
+        blob_properties = await blob_client.get_blob_properties()
+        self.assertEqual(blob_properties.blob_tier, blob_tier)
+
+    @record
+    def test_put_block_list_with_blob_tier_specified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_put_block_list_with_blob_tier_specified())
 
     async def _test_get_block_list_no_blocks(self):
         # Arrange
@@ -501,7 +528,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
 
         # Assert
         output = await blob.download_blob(lease=lease)
-        actual = await output.content_as_bytes()
+        actual = await output.readall()
         self.assertEqual(actual, data)
         self.assertEqual(output.properties.etag, create_resp.get('etag'))
         self.assertEqual(output.properties.last_modified, create_resp.get('last_modified'))
@@ -613,7 +640,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
 
         # Assert
         db = await blob.download_blob()
-        output = await db.content_as_bytes()
+        output = await db.readall()
         self.assertEqual(data[3:], output)
 
     @record
@@ -633,7 +660,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
 
         # Assert
         db = await blob.download_blob()
-        output = await db.content_as_bytes()
+        output = await db.readall()
         self.assertEqual(data[3:8], output)
 
     @record
@@ -656,7 +683,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
 
         # Assert
         db = await blob.download_blob()
-        output = await db.content_as_bytes()
+        output = await db.readall()
         self.assertEqual(data[3:8],output)
         properties = await blob.get_blob_properties()
         self.assertEqual(properties.content_settings.content_type, content_settings.content_type)
@@ -675,7 +702,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
         data = self.get_random_bytes(LARGE_BLOB_SIZE)
 
         # Act
-        await blob.upload_blob(data, length=LARGE_BLOB_SIZE, max_connections=1)
+        await blob.upload_blob(data, length=LARGE_BLOB_SIZE, max_concurrency=1)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob.blob_name, data)
@@ -684,6 +711,26 @@ class StorageBlockBlobTestAsync(StorageTestCase):
     def test_create_blob_from_bytes_non_parallel(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_create_blob_from_bytes_non_parallel())
+
+    async def _test_create_blob_from_bytes_with_blob_tier_specified(self):
+        # Arrange
+        await self._setup()
+        blob_name = self._get_blob_reference()
+        blob_client = self.bsc.get_blob_client(self.container_name, blob_name)
+        data = b'hello world'
+        blob_tier = StandardBlobTier.Cool
+
+        # Act
+        await blob_client.upload_blob(data, standard_blob_tier=blob_tier)
+        blob_properties = await blob_client.get_blob_properties()
+
+        # Assert
+        self.assertEqual(blob_properties.blob_tier, blob_tier)
+
+    @record
+    def test_create_blob_from_bytes_with_blob_tier_specified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_create_blob_from_bytes_with_blob_tier_specified())
 
     async def _test_create_blob_from_path(self):
         # parallel tests introduce random order of requests, can only run live
@@ -724,7 +771,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
 
         # Act
         with open(FILE_PATH, 'rb') as stream:
-            create_resp = await blob.upload_blob(stream, length=100, max_connections=1)
+            create_resp = await blob.upload_blob(stream, length=100, max_concurrency=1)
         props = await blob.get_blob_properties()
 
         # Assert
@@ -736,6 +783,28 @@ class StorageBlockBlobTestAsync(StorageTestCase):
     def test_create_blob_from_path_non_parallel(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_create_blob_from_path_non_parallel())
+
+    async def _test_upload_blob_from_path_non_parallel_with_standard_blob_tier(self):
+        # Arrange
+        await self._setup()
+        blob_name = self._get_blob_reference()
+        blob = self.bsc.get_blob_client(self.container_name, blob_name)
+        data = self.get_random_bytes(100)
+        with open(FILE_PATH, 'wb') as stream:
+            stream.write(data)
+        blob_tier = StandardBlobTier.Cool
+        # Act
+        with open(FILE_PATH, 'rb') as stream:
+            await blob.upload_blob(stream, length=100, max_concurrency=1, standard_blob_tier=blob_tier)
+        props = await blob.get_blob_properties()
+
+        # Assert
+        self.assertEqual(props.blob_tier, blob_tier)
+
+    @record
+    def test_upload_blob_from_path_non_parallel_with_standard_blob_tier_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_blob_from_path_non_parallel_with_standard_blob_tier())
 
     async def _test_create_blob_from_path_with_progress(self):
         # parallel tests introduce random order of requests, can only run live
@@ -846,7 +915,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
         # Act
         with open(FILE_PATH, 'rb') as stream:
             non_seekable_file = StorageBlockBlobTestAsync.NonSeekableFile(stream)
-            await blob.upload_blob(non_seekable_file, length=blob_size, max_connections=1)
+            await blob.upload_blob(non_seekable_file, length=blob_size, max_concurrency=1)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data[:blob_size])
@@ -872,7 +941,7 @@ class StorageBlockBlobTestAsync(StorageTestCase):
         # Act
         with open(FILE_PATH, 'rb') as stream:
             non_seekable_file = StorageBlockBlobTestAsync.NonSeekableFile(stream)
-            await blob.upload_blob(non_seekable_file, max_connections=1)
+            await blob.upload_blob(non_seekable_file, max_concurrency=1)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data)
@@ -1001,6 +1070,38 @@ class StorageBlockBlobTestAsync(StorageTestCase):
 
     @record
     def test_create_blob_from_stream_chunked_upload_with_properties(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_create_blob_from_stream_chunked_upload_with_properties())
+
+    async def _test_create_blob_from_stream_chunked_upload_with_properties(self):
+        # parallel tests introduce random order of requests, can only run live
+        if TestMode.need_recording_file(self.test_mode):
+            return
+
+        # Arrange
+        await self._setup()
+        blob_name = self._get_blob_reference()
+        blob = self.bsc.get_blob_client(self.container_name, blob_name)
+        data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        with open(FILE_PATH, 'wb') as stream:
+            stream.write(data)
+        blob_tier = StandardBlobTier.Cool
+
+        # Act
+        content_settings = ContentSettings(
+            content_type='image/png',
+            content_language='spanish')
+        with open(FILE_PATH, 'rb') as stream:
+            await blob.upload_blob(stream, content_settings=content_settings, max_concurrency=2,
+                                   standard_blob_tier=blob_tier)
+
+        properties = await blob.get_blob_properties()
+
+        # Assert
+        self.assertEqual(properties.blob_tier, blob_tier)
+
+    @record
+    def test_create_blob_from_stream_chunked_upload_with_properties_async(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_create_blob_from_stream_chunked_upload_with_properties())
 

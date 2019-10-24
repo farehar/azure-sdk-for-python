@@ -15,11 +15,12 @@ import unittest
 from azure.core.pipeline.transport import AioHttpTransport
 from multidict import CIMultiDict, CIMultiDictProxy
 
+from azure.storage.blob import ContentSettings
+
 from azure.storage.blob.aio import (
     BlobServiceClient,
     ContainerClient,
-    BlobClient,
-    ContentSettings
+    BlobClient
 )
 
 if os.sys.version_info >= (3,):
@@ -110,7 +111,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
         blob = self.bsc.get_blob_client(container_name, blob_name)
         actual_data = await blob.download_blob()
         actual_bytes = b""
-        async for data in actual_data:
+        async for data in actual_data.chunks():
             actual_bytes += data
         self.assertEqual(actual_bytes, expected_data)
 
@@ -224,7 +225,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
 
         # Act
         with open(FILE_PATH, 'rb') as stream:
-            await blob.upload_blob(stream, max_connections=2)
+            await blob.upload_blob(stream, max_concurrency=2)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data)
@@ -249,7 +250,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
 
         # Act
         with open(FILE_PATH, 'rb') as stream:
-            await blob.upload_blob(stream, validate_content=True, max_connections=2)
+            await blob.upload_blob(stream, validate_content=True, max_concurrency=2)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data)
@@ -273,7 +274,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
 
         # Act
         with open(FILE_PATH, 'rb') as stream:
-            await blob.upload_blob(stream, max_connections=1)
+            await blob.upload_blob(stream, max_concurrency=1)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data)
@@ -305,7 +306,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
                 progress.append((current, total))
 
         with open(FILE_PATH, 'rb') as stream:
-            await blob.upload_blob(stream, max_connections=2, raw_response_hook=callback)
+            await blob.upload_blob(stream, max_concurrency=2, raw_response_hook=callback)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data)
@@ -334,7 +335,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
             content_type='image/png',
             content_language='spanish')
         with open(FILE_PATH, 'rb') as stream:
-            await blob.upload_blob(stream, content_settings=content_settings, max_connections=2)
+            await blob.upload_blob(stream, content_settings=content_settings, max_concurrency=2)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data)
@@ -362,7 +363,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
 
         # Act
         with open(FILE_PATH, 'rb') as stream:
-            await blob.upload_blob(stream, max_connections=2)
+            await blob.upload_blob(stream, max_concurrency=2)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data)
@@ -394,7 +395,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
                 progress.append((current, total))
 
         with open(FILE_PATH, 'rb') as stream:
-            await blob.upload_blob(stream, max_connections=2, raw_response_hook=callback)
+            await blob.upload_blob(stream, max_concurrency=2, raw_response_hook=callback)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data)
@@ -421,7 +422,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
         # Act
         blob_size = len(data) - 301
         with open(FILE_PATH, 'rb') as stream:
-            await blob.upload_blob(stream, length=blob_size, max_connections=2)
+            await blob.upload_blob(stream, length=blob_size, max_concurrency=2)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data[:blob_size])
@@ -451,7 +452,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
         blob_size = len(data) - 301
         with open(FILE_PATH, 'rb') as stream:
             await blob.upload_blob(
-                stream, length=blob_size, content_settings=content_settings, max_connections=2)
+                stream, length=blob_size, content_settings=content_settings, max_concurrency=2)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data[:blob_size])
@@ -482,7 +483,7 @@ class StorageLargeBlockBlobTestAsync(StorageTestCase):
             content_type='image/png',
             content_language='spanish')
         with open(FILE_PATH, 'rb') as stream:
-            await blob.upload_blob(stream, content_settings=content_settings, max_connections=2)
+            await blob.upload_blob(stream, content_settings=content_settings, max_concurrency=2)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob_name, data)

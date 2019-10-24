@@ -8,26 +8,24 @@
 import unittest
 import pytest
 import asyncio
+from devtools_testutils import ResourceGroupPreparer, StorageAccountPreparer
 from azure.core.pipeline.transport import AioHttpTransport
 from multidict import CIMultiDict, CIMultiDictProxy
 from azure.core.exceptions import HttpResponseError
-
-from azure.storage.queue.aio import (
-    QueueServiceClient,
-    QueueClient,
-    Logging,
+from azure.storage.queue import (
+    QueueAnalyticsLogging,
     Metrics,
     CorsRule,
     RetentionPolicy
 )
-
-from queuetestcase import (
-    QueueTestCase,
-    record,
-    not_for_emulator,
-    TestMode
+from azure.storage.queue.aio import (
+    QueueServiceClient,
+    QueueClient,
 )
 
+from asyncqueuetestcase import (
+    AsyncQueueTestCase
+)
 
 # ------------------------------------------------------------------------------
 class AiohttpTestTransport(AioHttpTransport):
@@ -40,19 +38,12 @@ class AiohttpTestTransport(AioHttpTransport):
             response.content_type = response.headers.get("content-type")
         return response
 
-class QueueServicePropertiesTest(QueueTestCase):
-    def setUp(self):
-        super(QueueServicePropertiesTest, self).setUp()
-
-        url = self._get_queue_url()
-        credential = self._get_shared_key_credential()
-        self.qsc = QueueServiceClient(url, credential=credential, transport=AiohttpTestTransport())
-
+class QueueServicePropertiesTest(AsyncQueueTestCase):
     # --Helpers-----------------------------------------------------------------
     def _assert_properties_default(self, prop):
         self.assertIsNotNone(prop)
 
-        self._assert_logging_equal(prop.logging, Logging())
+        self._assert_logging_equal(prop.logging, QueueAnalyticsLogging())
         self._assert_metrics_equal(prop.hour_metrics, Metrics())
         self._assert_metrics_equal(prop.minute_metrics, Metrics())
         self._assert_cors_equal(prop.cors, list())
@@ -125,80 +116,78 @@ class QueueServicePropertiesTest(QueueTestCase):
 
     # --Test cases per service ---------------------------------------
 
-    async def _test_queue_service_properties(self):
+    @ResourceGroupPreparer()
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    @AsyncQueueTestCase.await_prepared_test
+    async def test_queue_service_properties(self, resource_group, location, storage_account, storage_account_key):
         # Arrange
+        qsc = QueueServiceClient(self._account_url(storage_account.name), storage_account_key, transport=AiohttpTestTransport())
 
         # Act
-        resp = await self.qsc.set_service_properties(
-            logging=Logging(),
+        resp = await qsc.set_service_properties(
+            analytics_logging=QueueAnalyticsLogging(),
             hour_metrics=Metrics(),
             minute_metrics=Metrics(),
             cors=list())
 
         # Assert
         self.assertIsNone(resp)
-        props = await self.qsc.get_service_properties()
+        props = await qsc.get_service_properties()
         self._assert_properties_default(props)
 
-    @record
-    def test_queue_service_properties(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._test_queue_service_properties())
-
     # --Test cases per feature ---------------------------------------
-
-    async def _test_set_logging(self):
+    @ResourceGroupPreparer()
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    @AsyncQueueTestCase.await_prepared_test
+    async def test_set_logging(self, resource_group, location, storage_account, storage_account_key):
         # Arrange
-        logging = Logging(read=True, write=True, delete=True, retention_policy=RetentionPolicy(enabled=True, days=5))
+        qsc = QueueServiceClient(self._account_url(storage_account.name), storage_account_key, transport=AiohttpTestTransport())
+        logging = QueueAnalyticsLogging(read=True, write=True, delete=True, retention_policy=RetentionPolicy(enabled=True, days=5))
 
         # Act
-        await self.qsc.set_service_properties(logging=logging)
+        await qsc.set_service_properties(analytics_logging=logging)
 
         # Assert
-        received_props = await self.qsc.get_service_properties()
+        received_props = await qsc.get_service_properties()
         self._assert_logging_equal(received_props.logging, logging)
 
-    @record
-    def test_set_logging(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._test_set_logging())
-
-    async def _test_set_hour_metrics(self):
+    @ResourceGroupPreparer()
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    @AsyncQueueTestCase.await_prepared_test
+    async def test_set_hour_metrics(self, resource_group, location, storage_account, storage_account_key):
         # Arrange
+        qsc = QueueServiceClient(self._account_url(storage_account.name), storage_account_key, transport=AiohttpTestTransport())
         hour_metrics = Metrics(enabled=True, include_apis=True, retention_policy=RetentionPolicy(enabled=True, days=5))
 
         # Act
-        await self.qsc.set_service_properties(hour_metrics=hour_metrics)
+        await qsc.set_service_properties(hour_metrics=hour_metrics)
 
         # Assert
-        received_props = await self.qsc.get_service_properties()
+        received_props = await qsc.get_service_properties()
         self._assert_metrics_equal(received_props.hour_metrics, hour_metrics)
 
-    @record
-    def test_set_hour_metrics(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._test_set_hour_metrics())
-
-    async def _test_set_minute_metrics(self):
+    @ResourceGroupPreparer()
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    @AsyncQueueTestCase.await_prepared_test
+    async def test_set_minute_metrics(self, resource_group, location, storage_account, storage_account_key):
         # Arrange
+        qsc = QueueServiceClient(self._account_url(storage_account.name), storage_account_key, transport=AiohttpTestTransport())
         minute_metrics = Metrics(enabled=True, include_apis=True,
                                  retention_policy=RetentionPolicy(enabled=True, days=5))
 
         # Act
-        await self.qsc.set_service_properties(minute_metrics=minute_metrics)
+        await qsc.set_service_properties(minute_metrics=minute_metrics)
 
         # Assert
-        received_props = await self.qsc.get_service_properties()
+        received_props = await qsc.get_service_properties()
         self._assert_metrics_equal(received_props.minute_metrics, minute_metrics)
 
-    @record
-    def test_set_minute_metrics(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._test_set_minute_metrics())
-
-
-    async def _test_set_cors(self):
+    @ResourceGroupPreparer()
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    @AsyncQueueTestCase.await_prepared_test
+    async def test_set_cors(self, resource_group, location, storage_account, storage_account_key):
         # Arrange
+        qsc = QueueServiceClient(self._account_url(storage_account.name), storage_account_key, transport=AiohttpTestTransport())
         cors_rule1 = CorsRule(['www.xyz.com'], ['GET'])
 
         allowed_origins = ['www.xyz.com', "www.ab.com", "www.bc.com"]
@@ -216,57 +205,50 @@ class QueueServicePropertiesTest(QueueTestCase):
         cors = [cors_rule1, cors_rule2]
 
         # Act
-        await self.qsc.set_service_properties(cors=cors)
+        await qsc.set_service_properties(cors=cors)
 
         # Assert
-        received_props = await self.qsc.get_service_properties()
+        received_props = await qsc.get_service_properties()
         self._assert_cors_equal(received_props.cors, cors)
 
-    @record
-    def test_set_cors(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._test_set_cors())
-
     # --Test cases for errors ---------------------------------------
-    async def _test_retention_no_days(self):
+
+    @ResourceGroupPreparer()
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    @AsyncQueueTestCase.await_prepared_test
+    async def test_retention_no_days(self, resource_group, location, storage_account, storage_account_key):
         # Assert
+        qsc = QueueServiceClient(self._account_url(storage_account.name), storage_account_key, transport=AiohttpTestTransport())
         self.assertRaises(ValueError,
                           RetentionPolicy,
                           True, None)
 
-    @record
-    def test_retention_no_days(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._test_retention_no_days())
-
-    async def _test_too_many_cors_rules(self):
+    @ResourceGroupPreparer()
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    @AsyncQueueTestCase.await_prepared_test
+    async def test_too_many_cors_rules(self, resource_group, location, storage_account, storage_account_key):
         # Arrange
+        qsc = QueueServiceClient(self._account_url(storage_account.name), storage_account_key, transport=AiohttpTestTransport())
         cors = []
         for _ in range(0, 6):
             cors.append(CorsRule(['www.xyz.com'], ['GET']))
 
         # Assert
         with self.assertRaises(HttpResponseError):
-            await self.qsc.set_service_properties()
+            await qsc.set_service_properties()
     
-    @record
-    def test_too_many_cors_rules(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._test_too_many_cors_rules())
-
-    async def _test_retention_too_long(self):
+    @ResourceGroupPreparer()
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    @AsyncQueueTestCase.await_prepared_test
+    async def test_retention_too_long(self, resource_group, location, storage_account, storage_account_key):
         # Arrange
+        qsc = QueueServiceClient(self._account_url(storage_account.name), storage_account_key, transport=AiohttpTestTransport())
         minute_metrics = Metrics(enabled=True, include_apis=True,
                                  retention_policy=RetentionPolicy(enabled=True, days=366))
 
         # Assert
         with self.assertRaises(HttpResponseError):
-            await self.qsc.set_service_properties()
-
-    @record
-    def test_retention_too_long(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._test_retention_too_long())
+            await qsc.set_service_properties()
 
 # ------------------------------------------------------------------------------
 if __name__ == '__main__':

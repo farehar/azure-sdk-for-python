@@ -12,20 +12,28 @@ import os
 import unittest
 from datetime import datetime, timedelta
 
+from azure.core import MatchConditions
 from azure.core.exceptions import HttpResponseError, ResourceExistsError
 from azure.core.pipeline.transport import AioHttpTransport
 from multidict import CIMultiDict, CIMultiDictProxy
+
+from azure.storage.blob._shared.policies import StorageContentValidation
+
+from azure.storage.blob import (
+    BlobProperties,
+    BlobSasPermissions,
+    BlobType,
+    PremiumPageBlobTier,
+    SequenceNumberAction,
+    StorageErrorCode,
+    generate_blob_sas
+)
 
 from azure.storage.blob.aio import (
     BlobServiceClient,
     ContainerClient,
     BlobClient,
-    BlobProperties,
-    BlobPermissions,
-    BlobType,
-    PremiumPageBlobTier,
-    SequenceNumberAction,
-    StorageErrorCode)
+)
 
 from testcase import (
     StorageTestCase,
@@ -33,16 +41,20 @@ from testcase import (
     record,
 )
 
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 TEST_BLOB_PREFIX = 'blob'
 FILE_PATH = 'blob_input.temp.dat'
 LARGE_BLOB_SIZE = 64 * 1024 + 512
 EIGHT_TB = 8 * 1024 * 1024 * 1024 * 1024
-#------------------------------------------------------------------------------s
+SOURCE_BLOB_SIZE = 8 * 1024
+
+
+# ------------------------------------------------------------------------------s
 
 class AiohttpTestTransport(AioHttpTransport):
     """Workaround to vcrpy bug: https://github.com/kevin1024/vcrpy/pull/461
     """
+
     async def send(self, request, **config):
         response = await super(AiohttpTestTransport, self).send(request, **config)
         if not isinstance(response.headers, CIMultiDictProxy):
@@ -70,12 +82,14 @@ class StoragePageBlobTestAsync(StorageTestCase):
             transport=AiohttpTestTransport())
         self.config = self.bs._config
         self.container_name = self.get_resource_name('utcontainer')
+        self.source_container_name = self.get_resource_name('utcontainersource')
 
     def tearDown(self):
         if not self.is_playback():
             loop = asyncio.get_event_loop()
             try:
                 loop.run_until_complete(self.bs.delete_container(self.container_name))
+                loop.run_until_complete(self.bs.delete_container(self.source_container_name))
             except:
                 pass
 
@@ -87,21 +101,41 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         return super(StoragePageBlobTestAsync, self).tearDown()
 
-    #--Helpers-----------------------------------------------------------------
+    # --Helpers-----------------------------------------------------------------
 
     async def _setup(self):
         if not self.is_playback():
             await self.bs.create_container(self.container_name)
+            # create a container for copy source
+            await self.bs.create_container(self.source_container_name)
 
     def _get_blob_reference(self):
         return self.bs.get_blob_client(
             self.container_name,
             self.get_resource_name(TEST_BLOB_PREFIX))
 
-    async def _create_blob(self, length=512):
+    async def _create_blob(self, length=512, sequence_number=None):
         blob = self._get_blob_reference()
-        await blob.create_page_blob(size=length)
+        await blob.create_page_blob(size=length, sequence_number=sequence_number)
         return blob
+
+    async def _create_source_blob(self, data, offset, length):
+        blob_client = self.bs.get_blob_client(self.source_container_name,
+                                              self.get_resource_name(TEST_BLOB_PREFIX))
+        await blob_client.create_page_blob(size=length)
+        await blob_client.upload_page(data, offset=offset, length=length)
+        return blob_client
+
+    async def _create_sparse_page_blob(self, size=1024*1024, data=''):
+        blob_client = self._get_blob_reference()
+        await blob_client.create_page_blob(size=size)
+
+        range_start = 8*1024 + 512
+
+        # the page blob will be super sparse like this:'                         some data                      '
+        await blob_client.upload_page(data, offset=range_start, length=len(data))
+
+        return blob_client
 
     async def _wait_for_async_copy(self, blob):
         count = 0
@@ -117,13 +151,13 @@ class StoragePageBlobTestAsync(StorageTestCase):
     async def assertBlobEqual(self, container_name, blob_name, expected_data):
         blob = self.bs.get_blob_client(container_name, blob_name)
         stream = await blob.download_blob()
-        actual_data = await stream.content_as_bytes()
+        actual_data = await stream.readall()
         self.assertEqual(actual_data, expected_data)
 
-    async def assertRangeEqual(self, container_name, blob_name, expected_data, start_range, end_range):
+    async def assertRangeEqual(self, container_name, blob_name, expected_data, offset, length):
         blob = self.bs.get_blob_client(container_name, blob_name)
-        stream = await blob.download_blob(offset=start_range, length=end_range)
-        actual_data = await stream.content_as_bytes()
+        stream = await blob.download_blob(offset=offset, length=length)
+        actual_data = await stream.readall()
         self.assertEqual(actual_data, expected_data)
 
     class NonSeekableFile(object):
@@ -136,7 +170,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
         def read(self, count):
             return self.wrapped_file.read(count)
 
-    #--Test cases for page blobs --------------------------------------------
+    # --Test cases for page blobs --------------------------------------------
 
     async def _test_create_blob(self):
         # Arrange
@@ -182,11 +216,11 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         data = self.get_random_bytes(512)
-        await blob.upload_page(data, 0, 511, lease=lease)
+        await blob.upload_page(data, offset=0, length=512, lease=lease)
 
         # Assert
         content = await blob.download_blob(lease=lease)
-        actual = await content.content_as_bytes()
+        actual = await content.readall()
         self.assertEqual(actual, data)
 
     @record
@@ -201,7 +235,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         data = self.get_random_bytes(512)
-        resp = await blob.upload_page(data, 0, 511)
+        resp = await blob.upload_page(data, offset=0, length=512)
 
         # Assert
         self.assertIsNotNone(resp.get('etag'))
@@ -258,9 +292,9 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         data = self.get_random_bytes(512)
-        start_range = EIGHT_TB - 512
-        end_range = EIGHT_TB - 1
-        resp = await blob.upload_page(data, start_range, end_range)
+        start_offset = EIGHT_TB - 512
+        length = 512
+        resp = await blob.upload_page(data, offset=start_offset, length=length)
         props = await blob.get_blob_properties()
         page_ranges, cleared = await blob.get_page_ranges()
 
@@ -268,11 +302,11 @@ class StoragePageBlobTestAsync(StorageTestCase):
         self.assertIsNotNone(resp.get('etag'))
         self.assertIsNotNone(resp.get('last_modified'))
         self.assertIsNotNone(resp.get('blob_sequence_number'))
-        await self.assertRangeEqual(self.container_name, blob.blob_name, data, start_range, end_range)
+        await self.assertRangeEqual(self.container_name, blob.blob_name, data, start_offset, length)
         self.assertEqual(props.size, EIGHT_TB)
         self.assertEqual(1, len(page_ranges))
-        self.assertEqual(page_ranges[0]['start'], start_range)
-        self.assertEqual(page_ranges[0]['end'], end_range)
+        self.assertEqual(page_ranges[0]['start'], start_offset)
+        self.assertEqual(page_ranges[0]['end'], start_offset + length - 1)
 
     @record
     def test_update_8tb_blob_page(self):
@@ -286,7 +320,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         data = self.get_random_bytes(512)
-        resp = await blob.upload_page(data, 0, 511, validate_content=True)
+        resp = await blob.upload_page(data, offset=0, length=512, validate_content=True)
 
         # Assert
 
@@ -301,7 +335,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
         blob = await self._create_blob()
 
         # Act
-        resp = await blob.clear_page(0, 511)
+        resp = await blob.clear_page(offset=0, length=512)
 
         # Assert
         self.assertIsNotNone(resp.get('etag'))
@@ -324,7 +358,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
         await blob.create_page_blob(512, sequence_number=start_sequence)
 
         # Act
-        await blob.upload_page(data, 0, 511, if_sequence_number_lt=start_sequence + 1)
+        await blob.upload_page(data, offset=0, length=512, if_sequence_number_lt=start_sequence + 1)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob.blob_name, data)
@@ -344,7 +378,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         with self.assertRaises(HttpResponseError):
-            await blob.upload_page(data, 0, 511, if_sequence_number_lt=start_sequence)
+            await blob.upload_page(data, offset=0, length=512, if_sequence_number_lt=start_sequence)
 
         # Assert
 
@@ -362,7 +396,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
         await blob.create_page_blob(512, sequence_number=start_sequence)
 
         # Act
-        await blob.upload_page(data, 0, 511, if_sequence_number_lte=start_sequence)
+        await blob.upload_page(data, offset=0, length=512, if_sequence_number_lte=start_sequence)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob.blob_name, data)
@@ -382,7 +416,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         with self.assertRaises(HttpResponseError):
-            await blob.upload_page(data, 0, 511, if_sequence_number_lte=start_sequence - 1)
+            await blob.upload_page(data, offset=0, length=512, if_sequence_number_lte=start_sequence - 1)
 
         # Assert
 
@@ -400,7 +434,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
         await blob.create_page_blob(512, sequence_number=start_sequence)
 
         # Act
-        await blob.upload_page(data, 0, 511, if_sequence_number_eq=start_sequence)
+        await blob.upload_page(data, offset=0, length=512, if_sequence_number_eq=start_sequence)
 
         # Assert
         await self.assertBlobEqual(self.container_name, blob.blob_name, data)
@@ -420,7 +454,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         with self.assertRaises(HttpResponseError):
-            await blob.upload_page(data, 0, 511, if_sequence_number_eq=start_sequence - 1)
+            await blob.upload_page(data, offset=0, length=512, if_sequence_number_eq=start_sequence - 1)
 
         # Assert
 
@@ -436,7 +470,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         data = u'abcdefghijklmnop' * 32
-        resp = await blob.upload_page(data, 0, 511)
+        resp = await blob.upload_page(data, offset=0, length=512)
 
         # Assert
         self.assertIsNotNone(resp.get('etag'))
@@ -447,31 +481,594 @@ class StoragePageBlobTestAsync(StorageTestCase):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_update_page_unicode())
 
-    async def _test_get_page_ranges_no_pages(self):
+    async def _test_upload_pages_from_url(self):
         # Arrange
         await self._setup()
-        blob = await self._create_blob()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
 
-        # Act
-        ranges, cleared = await blob.get_page_ranges()
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
 
-        # Assert
-        self.assertIsNotNone(ranges)
-        self.assertIsInstance(ranges, list)
-        self.assertEqual(len(ranges), 0)
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(
+            source_blob_client.url + "?" + sas, offset=0, length=4 * 1024, source_offset=0)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, offset=4 * 1024,
+                                                                   length=4 * 1024, source_offset=4 * 1024)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
 
     @record
-    def test_get_page_ranges_no_pages(self):
+    def test_upload_pages_from_url_async(self):
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._test_get_page_ranges_no_pages())
+        loop.run_until_complete(self._test_upload_pages_from_url())
+
+    async def _test_upload_pages_from_url_and_validate_content_md5(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        src_md5 = StorageContentValidation.get_content_md5(source_blob_data)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                                   0,
+                                                                   SOURCE_BLOB_SIZE,
+                                                                   0,
+                                                                   source_content_md5=src_md5)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                                                SOURCE_BLOB_SIZE,
+                                                                0,
+                                                                source_content_md5=StorageContentValidation.get_content_md5(
+                                                                    b"POTATO"))
+
+    @record
+    def test_upload_pages_from_url_and_validate_content_md5_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_and_validate_content_md5())
+
+    async def _test_upload_pages_from_url_with_source_if_modified(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                                   0,
+                                                                   SOURCE_BLOB_SIZE,
+                                                                   0,
+                                                                   source_if_modified_since=source_properties.get(
+                                                                       'last_modified') - timedelta(
+                                                                       hours=15))
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                                                SOURCE_BLOB_SIZE,
+                                                                0,
+                                                                source_if_modified_since=source_properties.get(
+                                                                    'last_modified'))
+
+    @record
+    def test_upload_pages_from_url_with_source_if_modified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_source_if_modified())
+
+    async def _test_upload_pages_from_url_with_source_if_unmodified(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                                   0,
+                                                                   SOURCE_BLOB_SIZE,
+                                                                   0,
+                                                                   source_if_unmodified_since=source_properties.get(
+                                                                       'last_modified'))
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                                                SOURCE_BLOB_SIZE,
+                                                                0,
+                                                                source_if_unmodified_since=source_properties.get(
+                                                                    'last_modified') - timedelta(
+                                                                    hours=15))
+
+    @record
+    def test_upload_pages_from_url_with_source_if_unmodified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_source_if_unmodified())
+
+    async def _test_upload_pages_from_url_with_source_if_match(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(
+            source_blob_client.url + "?" + sas, 0, SOURCE_BLOB_SIZE, 0,
+            source_etag=source_properties.get('etag'),
+            source_match_condition=MatchConditions.IfNotModified)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(
+                source_blob_client.url + "?" + sas, 0, SOURCE_BLOB_SIZE, 0,
+                source_etag='0x111111111111111',
+                source_match_condition=MatchConditions.IfNotModified)
+
+    @record
+    def test_upload_pages_from_url_with_source_if_match_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_source_if_match())
+
+    async def _test_upload_pages_from_url_with_source_if_none_match(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(
+            source_blob_client.url + "?" + sas, 0, SOURCE_BLOB_SIZE, 0,
+            source_etag='0x111111111111111', source_match_condition=MatchConditions.IfModified)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(
+                source_blob_client.url + "?" + sas, 0, SOURCE_BLOB_SIZE, 0,
+                source_etag=source_properties.get('etag'), source_match_condition=MatchConditions.IfModified)
+
+    @record
+    def test_upload_pages_from_url_with_source_if_none_match_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_source_if_none_match())
+
+    async def _test_upload_pages_from_url_with_if_modified(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                                   0,
+                                                                   SOURCE_BLOB_SIZE,
+                                                                   0,
+                                                                   if_modified_since=source_properties.get(
+                                                                       'last_modified') - timedelta(
+                                                                       minutes=15))
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                                                SOURCE_BLOB_SIZE,
+                                                                0,
+                                                                if_modified_since=blob_properties.get(
+                                                                    'last_modified'))
+
+    @record
+    def test_upload_pages_from_url_with_if_modified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_if_modified())
+
+    async def _test_upload_pages_from_url_with_if_unmodified(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                                   0,
+                                                                   SOURCE_BLOB_SIZE,
+                                                                   0,
+                                                                   if_unmodified_since=source_properties.get(
+                                                                       'last_modified') + timedelta(minutes=15))
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                                                SOURCE_BLOB_SIZE,
+                                                                0,
+                                                                if_unmodified_since=source_properties.get(
+                                                                    'last_modified') - timedelta(
+                                                                    minutes=15))
+
+    @record
+    def test_upload_pages_from_url_with_if_unmodified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_if_unmodified())
+
+    async def _test_upload_pages_from_url_with_if_match(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(
+            source_blob_client.url + "?" + sas, 0, SOURCE_BLOB_SIZE, 0,
+            etag=destination_blob_properties.get('etag'),
+            match_condition=MatchConditions.IfNotModified)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(
+                source_blob_client.url + "?" + sas, 0, SOURCE_BLOB_SIZE, 0,
+                etag='0x111111111111111',
+                match_condition=MatchConditions.IfNotModified)
+
+    @record
+    def test_upload_pages_from_url_with_if_match_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_if_match())
+
+    async def _test_upload_pages_from_url_with_if_none_match(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                                   0,
+                                                                   SOURCE_BLOB_SIZE,
+                                                                   0,
+                                                                   etag='0x111111111111111',
+                                                                   match_condition=MatchConditions.IfModified)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                                                SOURCE_BLOB_SIZE,
+                                                                0,
+                                                                etag=blob_properties.get('etag'),
+                                                                match_condition=MatchConditions.IfModified)
+
+    @record
+    def test_upload_pages_from_url_with_if_none_match_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_if_none_match())
+
+    async def _test_upload_pages_from_url_with_sequence_number_lt(self):
+        # Arrange
+        await self._setup()
+        start_sequence = 10
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE, sequence_number=start_sequence)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                                   0,
+                                                                   SOURCE_BLOB_SIZE,
+                                                                   0,
+                                                                   if_sequence_number_lt=start_sequence + 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                                                SOURCE_BLOB_SIZE,
+                                                                0,
+                                                                if_sequence_number_lt=start_sequence)
+
+    @record
+    def test_upload_pages_from_url_with_sequence_number_lt_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_sequence_number_lt())
+
+    async def _test_upload_pages_from_url_with_sequence_number_lte(self):
+        # Arrange
+        await self._setup()
+        start_sequence = 10
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE, sequence_number=start_sequence)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                                   0,
+                                                                   SOURCE_BLOB_SIZE,
+                                                                   0,
+                                                                   if_sequence_number_lte=start_sequence)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                                                SOURCE_BLOB_SIZE,
+                                                                0,
+                                                                if_sequence_number_lte=start_sequence - 1)
+
+    @record
+    def test_upload_pages_from_url_with_sequence_number_lte_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_sequence_number_lte())
+
+    async def _test_upload_pages_from_url_with_sequence_number_eq(self):
+        # Arrange
+        await self._setup()
+        start_sequence = 10
+        source_blob_data = self.get_random_bytes(SOURCE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data, 0, SOURCE_BLOB_SIZE)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1))
+
+        destination_blob_client = await self._create_blob(SOURCE_BLOB_SIZE, sequence_number=start_sequence)
+
+        # Act: make update page from url calls
+        resp = await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas,
+                                                                   0,
+                                                                   SOURCE_BLOB_SIZE,
+                                                                   0,
+                                                                   if_sequence_number_eq=start_sequence)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(self.container_name, destination_blob_client.blob_name, source_blob_data)
+        self.assertEqual(blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.upload_pages_from_url(source_blob_client.url + "?" + sas, 0,
+                                                                SOURCE_BLOB_SIZE,
+                                                                0,
+                                                                if_sequence_number_eq=start_sequence + 1)
+
+    @record
+    def test_upload_pages_from_url_with_sequence_number_eq_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_upload_pages_from_url_with_sequence_number_eq())
+
+    # TODO: FIX THIS TEST
+    # @record
+    # def test_get_page_ranges_no_pages(self):
+    #     loop = asyncio.get_event_loop()
+    #     loop.run_until_complete(self._test_get_page_ranges_no_pages())
 
     async def _test_get_page_ranges_2_pages(self):
         # Arrange
         await self._setup()
         blob = await self._create_blob(2048)
         data = self.get_random_bytes(512)
-        resp1 = await blob.upload_page(data, 0, 511)
-        resp2 = await blob.upload_page(data, 1024, 1535)
+        resp1 = await blob.upload_page(data, offset=0, length=512)
+        resp2 = await blob.upload_page(data, offset=1024, length=512)
 
         # Act
         ranges, cleared = await blob.get_page_ranges()
@@ -496,9 +1093,9 @@ class StoragePageBlobTestAsync(StorageTestCase):
         blob = await self._create_blob(2048)
         data = self.get_random_bytes(1536)
         snapshot1 = await blob.create_snapshot()
-        await blob.upload_page(data, 0, 1535)
+        await blob.upload_page(data, offset=0, length=1536)
         snapshot2 = await blob.create_snapshot()
-        await blob.clear_page(512, 1023)
+        await blob.clear_page(offset=512, length=512)
 
         # Act
         ranges1, cleared1 = await blob.get_page_ranges(previous_snapshot_diff=snapshot1)
@@ -535,13 +1132,13 @@ class StoragePageBlobTestAsync(StorageTestCase):
         await self._setup()
         blob = await self._create_blob(2048)
         data = self.get_random_bytes(512)
-        resp1 = await blob.upload_page(data, 0, 511)
+        resp1 = await blob.upload_page(data, offset=0, length=512)
 
         # Act
         try:
-            await blob.upload_page(data, 1024, 1536)
+            await blob.upload_page(data, offset=1024, length=513)
         except ValueError as e:
-            self.assertEqual(str(e), 'end_range must be an integer that aligns with 512 page size')
+            self.assertEqual(str(e), 'length must be an integer that aligns with 512 page size')
             return
 
         # Assert
@@ -581,7 +1178,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
         # Act
         resp = await blob.set_sequence_number(SequenceNumberAction.Update, 6)
 
-        #Assert
+        # Assert
         self.assertIsNotNone(resp.get('etag'))
         self.assertIsNotNone(resp.get('last_modified'))
         self.assertIsNotNone(resp.get('blob_sequence_number'))
@@ -626,7 +1223,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
         self.assertEqual(props.blob_type, BlobType.PageBlob)
 
     @record
-    def test_create_page_blob_with_no_overwrite(self):
+    def test_create_page_blob_with_no_overwrite_async(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_create_page_blob_with_no_overwrite())
 
@@ -724,6 +1321,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         progress = []
+
         def callback(response):
             current = response.context['upload_stream_current']
             total = response.context['data_stream_total']
@@ -831,6 +1429,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         progress = []
+
         def callback(response):
             current = response.context['upload_stream_current']
             total = response.context['data_stream_total']
@@ -935,7 +1534,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
             await blob.upload_blob(
                 non_seekable_file,
                 length=blob_size,
-                max_connections=1,
+                max_concurrency=1,
                 blob_type=BlobType.PageBlob)
 
         # Assert
@@ -960,6 +1559,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         progress = []
+
         def callback(response):
             current = response.context['upload_stream_current']
             total = response.context['data_stream_total']
@@ -1019,6 +1619,7 @@ class StoragePageBlobTestAsync(StorageTestCase):
 
         # Act
         progress = []
+
         def callback(response):
             current = response.context['upload_stream_current']
             total = response.context['data_stream_total']
@@ -1084,18 +1685,22 @@ class StoragePageBlobTestAsync(StorageTestCase):
         await self._setup()
         source_blob = await self._create_blob(2048)
         data = self.get_random_bytes(512)
-        resp1 = await source_blob.upload_page(data, 0, 511)
-        resp2 = await source_blob.upload_page(data, 1024, 1535)
+        resp1 = await source_blob.upload_page(data, offset=0, length=512)
+        resp2 = await source_blob.upload_page(data, offset=1024, length=512)
         source_snapshot_blob = await source_blob.create_snapshot()
 
-        snapshot_blob = BlobClient(
+        snapshot_blob = BlobClient.from_blob_url(
             source_blob.url, credential=source_blob.credential, snapshot=source_snapshot_blob)
-        sas_token = snapshot_blob.generate_shared_access_signature(
-            permission=BlobPermissions.READ,
+        sas_token = generate_blob_sas(
+            snapshot_blob.account_name,
+            snapshot_blob.container_name,
+            snapshot_blob.blob_name,
+            snapshot=snapshot_blob.snapshot,
+            account_key=snapshot_blob.credential.account_key,
+            permission=BlobSasPermissions(read=True),
             expiry=datetime.utcnow() + timedelta(hours=1),
         )
-        sas_blob = BlobClient(snapshot_blob.url, credential=sas_token)
-
+        sas_blob = BlobClient.from_blob_url(snapshot_blob.url, credential=sas_token)
 
         # Act
         dest_blob = self.bs.get_blob_client(self.container_name, 'dest_blob')
@@ -1278,15 +1883,16 @@ class StoragePageBlobTestAsync(StorageTestCase):
             self.assertEqual(copy_ref.blob_tier, PremiumPageBlobTier.P30)
 
             source_blob2 = pbs.get_blob_client(
-               container_name,
-               self.get_resource_name(TEST_BLOB_PREFIX))
+                container_name,
+                self.get_resource_name(TEST_BLOB_PREFIX))
 
             await source_blob2.create_page_blob(1024)
             source_blob2_url = '{0}/{1}/{2}'.format(
                 self._get_premium_account_url(), source_blob2.container_name, source_blob2.blob_name)
 
             copy_blob2 = pbs.get_blob_client(container_name, 'blob2copy')
-            copy2 = await copy_blob2.start_copy_from_url(source_blob2_url, premium_page_blob_tier=PremiumPageBlobTier.P60)
+            copy2 = await copy_blob2.start_copy_from_url(source_blob2_url,
+                                                         premium_page_blob_tier=PremiumPageBlobTier.P60)
             self.assertIsNotNone(copy2)
             self.assertEqual(copy2['copy_status'], 'success')
             self.assertIsNotNone(copy2['copy_id'])
@@ -1312,6 +1918,45 @@ class StoragePageBlobTestAsync(StorageTestCase):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_blob_tier_copy_blob())
 
-#------------------------------------------------------------------------------
+    async def _test_download_sparse_page_blob(self):
+        # Arrange
+        await self._setup()
+        self.config.max_single_get_size = 4*1024
+        self.config.max_chunk_get_size = 1024
+
+        sparse_page_blob_size = 1024 * 1024
+        data = self.get_random_bytes(2048)
+        blob_client = await self._create_sparse_page_blob(size=sparse_page_blob_size, data=data)
+
+        # Act
+        page_ranges, cleared = await blob_client.get_page_ranges()
+        start = page_ranges[0]['start']
+        end = page_ranges[0]['end']
+
+        content = await blob_client.download_blob()
+        content = await content.readall()
+
+        # Assert
+        self.assertEqual(sparse_page_blob_size, len(content))
+        # make sure downloaded data is the same as the uploaded data
+        self.assertEqual(data, content[start: end + 1])
+        # assert all unlisted ranges are empty
+        for byte in content[:start-1]:
+            try:
+                self.assertEqual(byte, '\x00')
+            except:
+                self.assertEqual(byte, 0)
+        for byte in content[end+1:]:
+            try:
+                self.assertEqual(byte, '\x00')
+            except:
+                self.assertEqual(byte, 0)
+
+    @record
+    def test_download_sparse_page_blob_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_download_sparse_page_blob())
+
+# ------------------------------------------------------------------------------
 if __name__ == '__main__':
     unittest.main()

@@ -4,13 +4,8 @@
 # license information.
 #--------------------------------------------------------------------------
 
-import pytest
-import datetime
-import os
 import time
 import logging
-
-from azure.eventhub import EventHubError
 
 
 def create_eventhub_client(live_eventhub_config):
@@ -30,16 +25,6 @@ def create_eventhub_client(live_eventhub_config):
     )
     # [END create_eventhub_client]
     return client
-
-
-def create_eventhub_client_from_iothub_connection_string(live_eventhub_config):
-    # [START create_eventhub_client_iot_connstr]
-    import os
-    from azure.eventhub import EventHubClient
-
-    iot_connection_str = os.environ['IOTHUB_CONNECTION_STR']
-    client = EventHubClient.from_connection_string(iot_connection_str)
-    # [END create_eventhub_client_iot_connstr]
 
 
 def test_example_eventhub_sync_send_and_receive(live_eventhub_config):

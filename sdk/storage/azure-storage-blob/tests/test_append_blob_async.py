@@ -5,20 +5,26 @@
 # Licensed under the MIT License. See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
+from datetime import datetime, timedelta
+
 import pytest
 import asyncio
 
 import os
 import unittest
 
+from azure.core import MatchConditions
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError, ResourceModifiedError
 from azure.core.pipeline.transport import AioHttpTransport
 from multidict import CIMultiDict, CIMultiDictProxy
 
+from azure.storage.blob import BlobSasPermissions, generate_blob_sas
+from azure.storage.blob._shared.policies import StorageContentValidation
+from azure.storage.blob import BlobType
 from azure.storage.blob.aio import (
     BlobServiceClient,
     ContainerClient,
     BlobClient,
-    BlobType
 )
 from testcase import (
     StorageTestCase,
@@ -26,16 +32,19 @@ from testcase import (
     record,
 )
 
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 TEST_BLOB_PREFIX = 'blob'
 FILE_PATH = 'blob_input.temp.dat'
 LARGE_BLOB_SIZE = 64 * 1024
-#------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
 
 
 class AiohttpTestTransport(AioHttpTransport):
     """Workaround to vcrpy bug: https://github.com/kevin1024/vcrpy/pull/461
     """
+
     async def send(self, request, **config):
         response = await super(AiohttpTestTransport, self).send(request, **config)
         if not isinstance(response.headers, CIMultiDictProxy):
@@ -52,15 +61,21 @@ class StorageAppendBlobTestAsync(StorageTestCase):
         url = self._get_account_url()
         credential = self._get_shared_key_credential()
 
-        self.bsc = BlobServiceClient(url, credential=credential, max_block_size=4 * 1024, transport=AiohttpTestTransport())
+        self.bsc = BlobServiceClient(url, credential=credential, max_block_size=4 * 1024,
+                                     transport=AiohttpTestTransport())
         self.config = self.bsc._config
         self.container_name = self.get_resource_name('utcontainer')
+        self.source_container_name = self.get_resource_name('utcontainersource')
 
     def tearDown(self):
         if not self.is_playback():
             loop = asyncio.get_event_loop()
             try:
                 loop.run_until_complete(self.bsc.delete_container(self.container_name))
+            except:
+                pass
+            try:
+                loop.run_until_complete(self.bs.delete_container(self.source_container_name))
             except:
                 pass
 
@@ -72,12 +87,13 @@ class StorageAppendBlobTestAsync(StorageTestCase):
 
         return super(StorageAppendBlobTestAsync, self).tearDown()
 
-    #--Helpers-----------------------------------------------------------------
+    # --Helpers-----------------------------------------------------------------
 
     async def _setup(self):
         if not self.is_playback():
             try:
                 await self.bsc.create_container(self.container_name)
+                await self.bsc.create_container(self.source_container_name)
             except:
                 pass
 
@@ -92,9 +108,15 @@ class StorageAppendBlobTestAsync(StorageTestCase):
         await blob.create_append_blob()
         return blob
 
+    async def _create_source_blob(self, data):
+        blob_client = self.bsc.get_blob_client(self.source_container_name, self.get_resource_name(TEST_BLOB_PREFIX))
+        await blob_client.create_append_blob()
+        await blob_client.append_block(data)
+        return blob_client
+
     async def assertBlobEqual(self, blob, expected_data):
         stream = await blob.download_blob()
-        actual_data = await stream.content_as_bytes()
+        actual_data = await stream.readall()
         self.assertEqual(actual_data, expected_data)
 
     class NonSeekableFile(object):
@@ -107,7 +129,7 @@ class StorageAppendBlobTestAsync(StorageTestCase):
         def read(self, count):
             return self.wrapped_file.read(count)
 
-    #--Test cases for append blobs --------------------------------------------
+    # --Test cases for append blobs --------------------------------------------
 
     async def _test_create_blob_async(self):
         # Arrange
@@ -226,6 +248,579 @@ class StorageAppendBlobTestAsync(StorageTestCase):
     def test_append_block_with_md5_async(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_append_block_with_md5_async())
+
+    async def _test_append_block_from_url(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act: make append block from url calls
+        split = 4 * 1024
+        resp = await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                   source_offset=0, source_length=split)
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        resp = await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                   source_offset=split,
+                                                                   source_length=LARGE_BLOB_SIZE - split)
+        self.assertEqual(resp.get('blob_append_offset'), str(4 * 1024))
+        self.assertEqual(resp.get('blob_committed_block_count'), 2)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        blob = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(blob.get('etag'), resp.get('etag'))
+        self.assertEqual(blob.get('last_modified'), resp.get('last_modified'))
+        self.assertEqual(blob.get('size'), LARGE_BLOB_SIZE)
+
+        # Missing start range shouldn't pass the validation
+        with self.assertRaises(ValueError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_length=LARGE_BLOB_SIZE)
+
+    @record
+    def test_append_block_from_url_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url())
+
+    async def _test_append_block_from_url_and_validate_content_md5(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        src_md5 = StorageContentValidation.get_content_md5(source_blob_data)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls with correct md5
+        resp = await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                   source_content_md5=src_md5)
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with wrong md5
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_content_md5=StorageContentValidation.get_content_md5(
+                                                                    b"POTATO"))
+
+    @record
+    def test_append_block_from_url_and_validate_content_md5_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_and_validate_content_md5())
+
+    async def _test_append_block_from_url_with_source_if_modified(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        source_blob_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                   source_offset=0,
+                                                                   source_length=LARGE_BLOB_SIZE,
+                                                                   source_if_modified_since=source_blob_properties.get(
+                                                                       'last_modified') - timedelta(hours=15))
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(ResourceNotFoundError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_offset=0,
+                                                                source_length=LARGE_BLOB_SIZE,
+                                                                source_if_modified_since=source_blob_properties.get(
+                                                                    'last_modified'))
+
+    @record
+    def test_append_block_from_url_with_source_if_modified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_source_if_modified())
+
+    async def _test_append_block_from_url_with_source_if_unmodified(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        source_blob_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                   source_offset=0,
+                                                                   source_length=LARGE_BLOB_SIZE,
+                                                                   source_if_unmodified_since=source_blob_properties.get(
+                                                                       'last_modified'))
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+        self.assertEqual(destination_blob_properties.get('size'), LARGE_BLOB_SIZE)
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(ResourceModifiedError):
+            await destination_blob_client \
+                .append_block_from_url(source_blob_client.url + '?' + sas,
+                                       source_offset=0, source_length=LARGE_BLOB_SIZE,
+                                       if_unmodified_since=source_blob_properties.get('last_modified') - timedelta(
+                                           hours=15))
+
+    @record
+    def test_append_block_from_url_with_source_if_unmodified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_source_if_unmodified())
+
+    async def _test_append_block_from_url_with_source_if_match(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client. \
+            append_block_from_url(source_blob_client.url + '?' + sas,
+                                  source_offset=0, source_length=LARGE_BLOB_SIZE,
+                                  source_etag=source_properties.get('etag'),
+                                  source_match_condition=MatchConditions.IfNotModified)
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(ResourceNotFoundError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_offset=0,
+                                                                source_length=LARGE_BLOB_SIZE,
+                                                                source_etag='0x111111111111111',
+                                                                source_match_condition=MatchConditions.IfNotModified)
+
+    @record
+    def test_append_block_from_url_with_source_if_match_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_source_if_match())
+
+    async def _test_append_block_from_url_with_source_if_none_match(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client. \
+            append_block_from_url(source_blob_client.url + '?' + sas,
+                                  source_offset=0, source_length=LARGE_BLOB_SIZE,
+                                  source_etag='0x111111111111111',
+                                  source_match_condition=MatchConditions.IfModified)
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(ResourceNotFoundError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_offset=0,
+                                                                source_length=LARGE_BLOB_SIZE,
+                                                                source_etag=source_properties.get('etag'),
+                                                                source_match_condition=MatchConditions.IfModified)
+
+    @record
+    def test_append_block_from_url_with_source_if_none_match_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_source_if_none_match())
+
+    async def _test_append_block_from_url_with_if_match(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_name = self._get_blob_reference()
+        destination_blob_client = self.bsc.get_blob_client(
+            self.container_name,
+            destination_blob_name)
+        destination_blob_properties_on_creation = await destination_blob_client.create_append_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client. \
+            append_block_from_url(source_blob_client.url + '?' + sas,
+                                  source_offset=0, source_length=LARGE_BLOB_SIZE,
+                                  etag=destination_blob_properties_on_creation.get('etag'),
+                                  match_condition=MatchConditions.IfNotModified)
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(ResourceModifiedError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_offset=0,
+                                                                source_length=LARGE_BLOB_SIZE,
+                                                                etag='0x111111111111111',
+                                                                match_condition=MatchConditions.IfNotModified)
+
+    @record
+    def test_append_block_from_url_with_if_match_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_if_match())
+
+    async def _test_append_block_from_url_with_if_none_match(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client. \
+            append_block_from_url(source_blob_client.url + '?' + sas,
+                                  source_offset=0, source_length=LARGE_BLOB_SIZE,
+                                  etag='0x111111111111111', match_condition=MatchConditions.IfModified)
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+        self.assertEqual(destination_blob_properties.get('size'), LARGE_BLOB_SIZE)
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(ResourceModifiedError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_offset=0,
+                                                                source_length=LARGE_BLOB_SIZE,
+                                                                etag=destination_blob_properties.get('etag'),
+                                                                match_condition=MatchConditions.IfModified)
+
+    @record
+    def test_append_block_from_url_with_if_none_match_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_if_none_match())
+
+    async def _test_append_block_from_url_with_maxsize_condition(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client. \
+            append_block_from_url(source_blob_client.url + '?' + sas,
+                                  source_offset=0, source_length=LARGE_BLOB_SIZE,
+                                  maxsize_condition=LARGE_BLOB_SIZE + 1)
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+        self.assertEqual(destination_blob_properties.get('size'), LARGE_BLOB_SIZE)
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_offset=0,
+                                                                source_length=LARGE_BLOB_SIZE,
+                                                                maxsize_condition=LARGE_BLOB_SIZE + 1)
+
+    @record
+    def test_append_block_from_url_with_maxsize_condition_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_maxsize_condition())
+
+    async def _test_append_block_from_url_with_appendpos_condition(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client. \
+            append_block_from_url(source_blob_client.url + '?' + sas,
+                                  source_offset=0, source_length=LARGE_BLOB_SIZE,
+                                  appendpos_condition=0)
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+        self.assertEqual(destination_blob_properties.get('size'), LARGE_BLOB_SIZE)
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_offset=0,
+                                                                source_length=LARGE_BLOB_SIZE,
+                                                                appendpos_condition=0)
+
+    @record
+    def test_append_block_from_url_with_appendpos_condition_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_appendpos_condition())
+
+    async def _test_append_block_from_url_with_if_modified(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client. \
+            append_block_from_url(source_blob_client.url + '?' + sas,
+                                  source_offset=0, source_length=LARGE_BLOB_SIZE,
+                                  if_modified_since=source_properties.get('last_modified') - timedelta(minutes=15))
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+        self.assertEqual(destination_blob_properties.get('size'), LARGE_BLOB_SIZE)
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(HttpResponseError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_offset=0,
+                                                                source_length=LARGE_BLOB_SIZE,
+                                                                if_modified_since=destination_blob_properties.get(
+                                                                    'last_modified'))
+
+    @record
+    def test_append_block_from_url_with_if_modified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_if_modified())
+
+    async def _test_append_block_from_url_with_if_unmodified(self):
+        # Arrange
+        await self._setup()
+        source_blob_data = self.get_random_bytes(LARGE_BLOB_SIZE)
+        source_blob_client = await self._create_source_blob(source_blob_data)
+        source_properties = await source_blob_client.get_blob_properties()
+        sas = generate_blob_sas(
+            source_blob_client.account_name,
+            source_blob_client.container_name,
+            source_blob_client.blob_name,
+            snapshot=source_blob_client.snapshot,
+            account_key=source_blob_client.credential.account_key,
+            permission=BlobSasPermissions(read=True, delete=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        )
+
+        destination_blob_client = await self._create_blob()
+
+        # Act part 1: make append block from url calls
+        resp = await destination_blob_client. \
+            append_block_from_url(source_blob_client.url + '?' + sas,
+                                  source_offset=0, source_length=LARGE_BLOB_SIZE,
+                                  if_unmodified_since=source_properties.get('last_modified') + timedelta(minutes=15))
+        self.assertEqual(resp.get('blob_append_offset'), '0')
+        self.assertEqual(resp.get('blob_committed_block_count'), 1)
+        self.assertIsNotNone(resp.get('etag'))
+        self.assertIsNotNone(resp.get('last_modified'))
+
+        # Assert the destination blob is constructed correctly
+        destination_blob_properties = await destination_blob_client.get_blob_properties()
+        await self.assertBlobEqual(destination_blob_client, source_blob_data)
+        self.assertEqual(destination_blob_properties.get('etag'), resp.get('etag'))
+        self.assertEqual(destination_blob_properties.get('last_modified'), resp.get('last_modified'))
+        self.assertEqual(destination_blob_properties.get('size'), LARGE_BLOB_SIZE)
+
+        # Act part 2: put block from url with failing condition
+        with self.assertRaises(ResourceModifiedError):
+            await destination_blob_client.append_block_from_url(source_blob_client.url + '?' + sas,
+                                                                source_offset=0,
+                                                                source_length=LARGE_BLOB_SIZE,
+                                                                if_unmodified_since=destination_blob_properties.get(
+                                                                    'last_modified') - timedelta(minutes=15))
+
+    @record
+    def test_append_block_from_url_with_if_unmodified_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_append_block_from_url_with_if_unmodified())
 
     async def _test_create_append_blob_with_no_overwrite_async(self):
         # Arrange
@@ -355,7 +950,7 @@ class StorageAppendBlobTestAsync(StorageTestCase):
         def progress_gen(upload):
             progress.append((0, len(upload)))
             yield upload
-    
+
         upload_data = progress_gen(data)
         await blob.upload_blob(upload_data, blob_type=BlobType.AppendBlob)
 
@@ -770,6 +1365,7 @@ class StorageAppendBlobTestAsync(StorageTestCase):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_append_blob_with_md5_async())
 
-#------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
 if __name__ == '__main__':
     unittest.main()

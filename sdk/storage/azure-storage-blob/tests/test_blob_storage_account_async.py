@@ -12,13 +12,14 @@ import unittest
 from azure.core.pipeline.transport import AioHttpTransport
 from multidict import CIMultiDict, CIMultiDictProxy
 
+from azure.storage.blob._generated.models import RehydratePriority
 from azure.storage.blob.aio import (
     BlobServiceClient,
     ContainerClient,
     BlobClient,
 )
 
-from azure.storage.blob.models import (
+from azure.storage.blob import (
     StandardBlobTier
 )
 
@@ -87,7 +88,7 @@ class BlobStorageAccountTestAsync(StorageTestCase):
 
     async def assertBlobEqual(self, container_name, blob_name, expected_data):
         blob = self.bsc.get_blob_client(container_name, blob_name)
-        actual_data = await blob.download_blob().content_as_bytes()
+        actual_data = await blob.download_blob().readall()
         self.assertEqual(actual_data, expected_data)
 
     # --Tests specific to Blob Storage Accounts (not general purpose)------------
@@ -146,6 +147,28 @@ class BlobStorageAccountTestAsync(StorageTestCase):
     def test_standard_blob_tier_set_tier_api(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._test_standard_blob_tier_set_tier_api())
+
+    async def _test_set_standard_blob_tier_with_rehydrate_priority(self):
+        # Arrange
+        await self._setup()
+        blob_client = await self._create_blob()
+        blob_tier = StandardBlobTier.Archive
+        rehydrate_tier = StandardBlobTier.Cool
+        rehydrate_priority = RehydratePriority.standard
+
+        # Act
+        await blob_client.set_standard_blob_tier(blob_tier,
+                                                 rehydrate_priority=rehydrate_priority)
+        await blob_client.set_standard_blob_tier(rehydrate_tier)
+        blob_props = await blob_client.get_blob_properties()
+
+        # Assert
+        self.assertEqual('rehydrate-pending-to-cool', blob_props.archive_status)
+
+    @record
+    def test_set_standard_blob_tier_with_rehydrate_priority_async(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._test_set_standard_blob_tier_with_rehydrate_priority())
 
     async def _test_rehydration_status(self):
         await self._setup()

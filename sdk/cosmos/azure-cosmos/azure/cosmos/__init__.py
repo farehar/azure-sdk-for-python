@@ -19,9 +19,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from .container import Container
+from ._retry_utility import ConnectionRetryPolicy
+from .container import ContainerProxy
 from .cosmos_client import CosmosClient
-from .database import Database
+from .database import DatabaseProxy
+from .user import UserProxy
+from .scripts import ScriptsProxy
+from .offer import Offer
 from .documents import (
     ConsistencyLevel,
     DataType,
@@ -32,20 +36,22 @@ from .documents import (
     SSLConfiguration,
     TriggerOperation,
     TriggerType,
+    DatabaseAccount,
 )
 from .partition_key import PartitionKey
 from .permission import Permission
-from .scripts import Scripts
-from .user import User
+from .version import VERSION
 
 __all__ = (
-    "Container",
     "CosmosClient",
-    "Database",
+    "DatabaseProxy",
+    "ContainerProxy",
     "PartitionKey",
     "Permission",
-    "Scripts",
-    "User",
+    "ScriptsProxy",
+    "UserProxy",
+    "Offer",
+    "DatabaseAccount",
     "ConsistencyLevel",
     "DataType",
     "IndexKind",
@@ -55,4 +61,6 @@ __all__ = (
     "SSLConfiguration",
     "TriggerOperation",
     "TriggerType",
+    "ConnectionRetryPolicy",
 )
+__version__ = VERSION

@@ -6,37 +6,30 @@
 # license information.
 # --------------------------------------------------------------------------
 
-try:
-    import settings_real as settings
-except ImportError:
-    import queue_settings_fake as settings
-
-from queuetestcase import (
-    QueueTestCase,
-    record
-)
+from devtools_testutils import ResourceGroupPreparer, StorageAccountPreparer
+from queuetestcase import (QueueTestCase)
 
 
 class TestQueueHelloWorldSamples(QueueTestCase):
 
-    connection_string = settings.CONNECTION_STRING
-
-    @record
-    def test_create_client_with_connection_string(self):
+    @ResourceGroupPreparer()          
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    def test_create_client_with_connection_string(self, resource_group, location, storage_account, storage_account_key):
         # Instantiate the QueueServiceClient from a connection string
         from azure.storage.queue import QueueServiceClient
-        queue_service = QueueServiceClient.from_connection_string(self.connection_string)
+        queue_service = QueueServiceClient.from_connection_string(self.connection_string(storage_account, storage_account_key))
 
         # Get queue service properties
         properties = queue_service.get_service_properties()
 
         assert properties is not None
 
-    @record
-    def test_queue_and_messages_example(self):
+    @ResourceGroupPreparer()          
+    @StorageAccountPreparer(name_prefix='pyacrstorage')
+    def test_queue_and_messages_example(self, resource_group, location, storage_account, storage_account_key):
         # Instantiate the QueueClient from a connection string
         from azure.storage.queue import QueueClient
-        queue = QueueClient.from_connection_string(self.connection_string, "myqueue")
+        queue = QueueClient.from_connection_string(self.connection_string(storage_account, storage_account_key), "myqueue")
 
         # Create the queue
         # [START create_queue]
@@ -44,9 +37,9 @@ class TestQueueHelloWorldSamples(QueueTestCase):
         # [END create_queue]
 
         try:
-            # Enqueue messages
-            queue.enqueue_message(u"I'm using queues!")
-            queue.enqueue_message(u"This is my second message")
+            # Send messages
+            queue.send_message(u"I'm using queues!")
+            queue.send_message(u"This is my second message")
 
             # Receive the messages
             response = queue.receive_messages(messages_per_page=2)
